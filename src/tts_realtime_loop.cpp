@@ -235,9 +235,11 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
     const float kSilence      = 1e-3f;                 // ~-60 dBFS; the lead is < -90, speech ~-16
     const int   kKeepAhead    = 20 * out_rate / 1000;
     const int   kFadeIn       = 20 * out_rate / 1000;
+    const int   kLeadMax      = 1500 * out_rate / 1000;  // never swallow more than this
+    int   lead_dropped = 0;
     bool  lead_done   = !p.trim_lead;
     int   fade_left   = 0;                             // samples of fade-in still to apply
-    std::vector<float> lead_keep;                      // last kKeepAhead samples of the lead
+    std::vector<float> lead_keep;                      // the retained lead (at most kLeadMax)
     std::vector<float> trim_buf;
     auto ship = [&](const float* pcm, int n) -> bool {
         if (n <= 0) return true;
@@ -246,13 +248,15 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
         if (!lead_done) {
             int first = 0;
             while (first < n && std::fabs(pcm[first]) < kSilence) ++first;
-            if (first >= n) {
-                // still the lead: remember its tail for the keep-ahead
+            if (first >= n && lead_dropped + n <= kLeadMax) {
+                // still the lead: retain it (for the keep-ahead, and so a reply
+                // that never rises above the floor is delivered as silence at
+                // the end rather than as nothing)
+                lead_dropped += n;
                 lead_keep.insert(lead_keep.end(), pcm, pcm + n);
-                if (static_cast<int>(lead_keep.size()) > kKeepAhead)
-                    lead_keep.erase(lead_keep.begin(), lead_keep.end() - kKeepAhead);
                 return true;
             }
+            if (first >= n) first = 0;   // cap reached: deliver from here on, whatever it is
             lead_done = true;
             fade_left = kFadeIn;
             // keep-ahead: up to kKeepAhead samples before the onset, from
@@ -478,6 +482,11 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
     if (!aborted) {
         if (!emit_pending(true)) aborted = true;
         else if (use_pf && !deliver(nullptr, 0, true)) aborted = true;   // lookahead + overlap tail
+        if (!aborted && !lead_done && !lead_keep.empty()) {
+            // nothing ever rose above the floor: hand over what there is
+            if (!ctl.emit_audio(lead_keep.data(), static_cast<int>(lead_keep.size()))) aborted = true;
+            lead_keep.clear();
+        }
     }
     if (bench_enabled()) {
         char title[128];

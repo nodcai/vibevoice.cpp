@@ -51,6 +51,11 @@ int main() {
     vv::VibeVoiceTTSParams p;
     p.max_speech_frames = 2;
     p.n_diffusion_steps = 5;
+    // This checks the raw model output: no post-filter, no lead trim, no
+    // decoder warm-up trim, so the sample count is exactly frames x 3200.
+    p.postfilter          = false;
+    p.trim_lead           = false;
+    p.trim_decoder_warmup = false;
     p.seed              = 42;
     p.verbose           = false;
 

@@ -228,6 +228,10 @@ def main() -> int:
     # element-wise mul in the orchestrator until the loader pre-casts
     # norm/bias tensors.
     ap.add_argument("--dtype", choices=["fp16", "fp32"], default="fp32")
+    ap.add_argument("--dfn", default=None,
+                    help="deepfilternet3 gguf whose dfn.* tensors and keys are appended, "
+                         "so the runtime can run the DFN3 post-filter from this one file "
+                         "(same as scripts/merge_dfn_gguf.py on the result)")
     args = ap.parse_args()
 
     src = Path(args.src)
@@ -363,13 +367,34 @@ def main() -> int:
     for n, arr in tensors:
         w.add_tensor(n, arr)
 
+    # ------- optional DFN3 post-filter -------
+    n_dfn = 0
+    if args.dfn:
+        dfn = gguf.GGUFReader(args.dfn)
+        dfn_arch = dfn.fields.get("general.architecture")
+        if dfn_arch and dfn_arch.contents() != "deepfilternet3":
+            sys.stderr.write(f"error: --dfn architecture is {dfn_arch.contents()!r}, expected deepfilternet3\n")
+            return 2
+        for name, field in dfn.fields.items():
+            if not name.startswith("dfn."):
+                continue
+            if field.types[0] == gguf.GGUFValueType.ARRAY:
+                w.add_array(name, field.contents())
+            else:
+                w.add_key_value(name, field.contents(), field.types[0])
+        w.add_string("vibevoice.postfilter", "deepfilternet3")
+        for t in dfn.tensors:
+            if t.name.startswith("dfn."):
+                w.add_tensor(t.name, t.data, raw_shape=t.data.shape, raw_dtype=t.tensor_type)
+                n_dfn += 1
+
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
 
     sys.stderr.write(
-        f"wrote {out}: {len(tensors)} tensors  (unmapped={len(unmapped)})  "
+        f"wrote {out}: {len(tensors)} tensors + {n_dfn} dfn  (unmapped={len(unmapped)})  "
         f"hidden={dec['hidden_size']} lm_layers={n_lm_layers}+{n_tts_layers} "
         f"vocab={dec['vocab_size']}\n"
     )
