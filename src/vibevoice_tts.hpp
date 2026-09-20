@@ -28,6 +28,7 @@
 
 #include "acoustic_decoder_v2.hpp"
 #include "acoustic_tokenizer.hpp"
+#include "dfn.hpp"
 #include "diffusion_head.hpp"
 #include "dpm_solver.hpp"
 #include "model_loader.hpp"
@@ -111,6 +112,10 @@ struct VibeVoiceModel {
     // Set during vibevoice_load: "realtime-0.5b", "asr-7b", or "vibepod-1.5b".
     std::string      variant;
 
+    // DeepFilterNet3 post-filter, present when the gguf carries dfn.*
+    // tensors (scripts/merge_dfn_gguf.py). ready == false otherwise.
+    DfnModel         dfn;
+
     // ---- ASR-specific weights (only populated when variant == "asr-7b") ----
     EncoderWeights   at_enc;
     EncoderWeights   st_enc;
@@ -181,7 +186,20 @@ struct VibeVoiceTTSParams {
     float neg_condition_anchor      = 0.2f;// CFG negative path: blend of the post-prefill snapshot
     bool  flush_on_silence          = true;// emit pending audio once the latents have gone silent
     bool  trim_decoder_warmup       = true;// drop the decoder's 100 ms zero-state transient
+    // Run the DFN3 post-filter when the model carries it. The output is then
+    // at the filter's 48 kHz; see vibevoice_tts_output_sample_rate.
+    bool  postfilter                = true;
+    // Drop the model's lead-in silence (after the post-filter, which is what
+    // turns an opening artefact into silence): samples under ~-60 dBFS until
+    // the onset, keeping 20 ms ahead of it, then a 20 ms fade-in. Once per
+    // utterance; the trimmed audio is not delivered at all, so time-to-first
+    // -sound drops by the lead's length (typically ~150-800 ms).
+    bool  trim_lead                 = true;
 };
+
+// Sample rate of the audio the realtime path delivers for these params:
+// 48000 with the post-filter active, else the model's 24000.
+int vibevoice_tts_output_sample_rate(const VibeVoiceModel& model, const VibeVoiceTTSParams& p);
 
 // Text source + audio sink for the realtime loop. `pull_text` blocks until it
 // can return at least one token or sets *eof; it may return fewer than asked.

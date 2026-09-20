@@ -113,6 +113,8 @@ typedef struct {
     int      first_chunk_frames;   /* 0 -> 3; the dominant term in time-to-first-audio */
     int      lead_chunk_frames;    /* 0 -> off; hold this size until a chunk carried speech */
     float    neg_condition_anchor; /* < 0 -> 0.2; CFG negative-path anchor blend, 0..1 */
+    int      no_postfilter;        /* non-zero: skip the DFN3 post-filter (output then 24 kHz) */
+    int      no_trim;              /* non-zero: keep the lead-in silence */
 } vv_capi_stream_params;
 
 // Fills `p` with the defaults above (all zero / -1 means "default").

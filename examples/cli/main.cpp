@@ -47,6 +47,8 @@ void print_usage(const char* argv0) {
         "  --steps N           DPM-Solver inference steps (default 20)\n"
         "  --stream            push the text word by word through the streaming\n"
         "                      session and report the chunk timeline\n"
+        "  --no-postfilter     skip the DFN3 post-filter even if the model carries it\n"
+        "  --no-trim           keep the model's lead-in silence\n"
         "  --first-chunk N     first streamed chunk in latent frames (default 3)\n"
         "  --lead-chunk N      hold the chunk at N frames through the lead-in (0 = off)\n"
         "  --cfg X             classifier-free guidance scale (default 1.3,\n"
@@ -96,6 +98,8 @@ int cmd_tts(int argc, char** argv) {
     uint32_t seed = 0;
     bool  verbose = false;
     bool  stream = false;
+    bool  postfilter = true;
+    bool  trim_lead = true;
     int   first_chunk = 0, lead_chunk = 0;
 
     for (int i = 1; i < argc; ++i) {
@@ -113,6 +117,8 @@ int cmd_tts(int argc, char** argv) {
         else if (a == "--cfg"        && (i + 1 < argc)) { cfg_scale = static_cast<float>(std::atof(argv[++i])); }
         else if (a == "--verbose")                       { verbose = true; }
         else if (a == "--stream")                        { stream = true; }
+        else if (a == "--no-postfilter")                 { postfilter = false; }
+        else if (a == "--no-trim")                       { trim_lead = false; }
         else if (a == "--first-chunk" && (i + 1 < argc)) { first_chunk = std::atoi(argv[++i]); }
         else if (a == "--lead-chunk"  && (i + 1 < argc)) { lead_chunk  = std::atoi(argv[++i]); }
         else if (a == "-h" || a == "--help") {
@@ -202,6 +208,8 @@ int cmd_tts(int argc, char** argv) {
     p.seed              = seed;
     p.verbose           = verbose;
 
+    p.postfilter = postfilter;
+    p.trim_lead  = trim_lead;
     if (first_chunk > 0) p.stream_first_chunk_frames = first_chunk;
     if (lead_chunk  > 0) p.stream_lead_chunk_frames  = lead_chunk;
 
@@ -215,7 +223,7 @@ int cmd_tts(int argc, char** argv) {
         if (!st.begin(&model, p, [&](const float* pcm, int n) {
                 const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
                 std::fprintf(stderr, "tts: chunk %2d at %7.1f ms: %6d samples (%.2f s audio so far)\n",
-                             n_chunks, ms, n, static_cast<double>(samples.size() + n) / model.cfg.sample_rate);
+                             n_chunks, ms, n, static_cast<double>(samples.size() + n) / st.sample_rate());
                 samples.insert(samples.end(), pcm, pcm + n);
                 ++n_chunks;
             })) { std::fprintf(stderr, "tts: stream begin failed\n"); return 4; }
@@ -239,15 +247,16 @@ int cmd_tts(int argc, char** argv) {
             return 4;
         }
     }
-    std::fprintf(stderr, "tts: generated %zu samples (%.2fs at %d Hz)\n",
+    const int out_rate = vv::vibevoice_tts_output_sample_rate(model, p);
+    std::fprintf(stderr, "tts: generated %zu samples (%.2fs at %d Hz%s)\n",
                  samples.size(),
-                 static_cast<double>(samples.size()) / model.cfg.sample_rate,
-                 model.cfg.sample_rate);
+                 static_cast<double>(samples.size()) / out_rate, out_rate,
+                 (p.postfilter && model.dfn.ready) ? ", post-filtered" : "");
 
     vv_audio out;
     out.samples     = samples.data();
     out.n_samples   = samples.size();
-    out.sample_rate = model.cfg.sample_rate;
+    out.sample_rate = out_rate;
     out.channels    = 1;
     if (vv_save_wav(out_path.c_str(), &out) != VV_OK) {
         std::fprintf(stderr, "tts: failed to write %s\n", out_path.c_str());

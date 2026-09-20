@@ -72,6 +72,8 @@ bool vibevoice_load(const std::string& path, VibeVoiceModel* out) {
     m.promote_small_f16_to_f32();
 
     out->variant = m.get_str("vibevoice.variant", "realtime-0.5b");
+    if (dfn_model_present(m) && !dfn_model_load(m, &out->dfn))
+        VV_LOG_WARN("post-filter tensors present but unusable; continuing without it");
     const bool is_asr      = (out->variant == "asr-7b");
     const bool is_realtime = (out->variant == "realtime-0.5b");
     const bool is_15b      = (out->variant == "1.5b");

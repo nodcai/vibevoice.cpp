@@ -29,6 +29,8 @@
 #include "backend.hpp"
 #include "bench.hpp"
 #include "common.hpp"
+#include "dfn.hpp"
+#include "resample2x.hpp"
 #include "tts_frame_graph.hpp"
 #include "vibevoice_tts.hpp"
 #include "vibevoice_tts_internal.hpp"
@@ -40,11 +42,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 namespace vv {
+
+int vibevoice_tts_output_sample_rate(const VibeVoiceModel& model, const VibeVoiceTTSParams& p) {
+    return (p.postfilter && model.dfn.ready) ? model.dfn.sample_rate : model.cfg.sample_rate;
+}
 
 using detail::add_input_type_embedding;
 using detail::run_eos_classifier;
@@ -210,6 +217,74 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
     constexpr int kWarmupSamples = 2400;   // decoder zero-state transient, 100 ms @ 24 kHz
     bool aborted = false;
 
+    // ---- post-filter: 24 kHz -> 2x -> DFN3 at 48 kHz ----
+    const bool use_pf = p.postfilter && model->dfn.ready;
+    std::unique_ptr<DfnStream> pf;
+    Upsampler2x up2x;
+    std::vector<float> pf_in, pf_out;
+    if (use_pf) {
+        BenchScope bs(&bench, "dfn_warmup");
+        pf = std::make_unique<DfnStream>(model->dfn);
+        pf->warmup(100);
+    }
+    // ---- lead trim: runs on what the listener would hear (post-filtered) ----
+    // The model puts digital silence in front of every reply (~150-800 ms),
+    // or an artefact the post-filter turns into silence. Drop it until the
+    // onset, keep 20 ms ahead of the onset so it is not a step, fade in 20 ms.
+    const int   out_rate      = use_pf ? model->dfn.sample_rate : cfg.sample_rate;
+    const float kSilence      = 1e-3f;                 // ~-60 dBFS; the lead is < -90, speech ~-16
+    const int   kKeepAhead    = 20 * out_rate / 1000;
+    const int   kFadeIn       = 20 * out_rate / 1000;
+    bool  lead_done   = !p.trim_lead;
+    int   fade_left   = 0;                             // samples of fade-in still to apply
+    std::vector<float> lead_keep;                      // last kKeepAhead samples of the lead
+    std::vector<float> trim_buf;
+    auto ship = [&](const float* pcm, int n) -> bool {
+        if (n <= 0) return true;
+        if (lead_done && fade_left <= 0) return ctl.emit_audio(pcm, n);
+        trim_buf.clear();
+        if (!lead_done) {
+            int first = 0;
+            while (first < n && std::fabs(pcm[first]) < kSilence) ++first;
+            if (first >= n) {
+                // still the lead: remember its tail for the keep-ahead
+                lead_keep.insert(lead_keep.end(), pcm, pcm + n);
+                if (static_cast<int>(lead_keep.size()) > kKeepAhead)
+                    lead_keep.erase(lead_keep.begin(), lead_keep.end() - kKeepAhead);
+                return true;
+            }
+            lead_done = true;
+            fade_left = kFadeIn;
+            // keep-ahead: up to kKeepAhead samples before the onset, from
+            // this chunk and, if needed, the remembered lead tail
+            const int from_chunk = std::min(first, kKeepAhead);
+            const int from_lead  = std::min(static_cast<int>(lead_keep.size()), kKeepAhead - from_chunk);
+            trim_buf.insert(trim_buf.end(), lead_keep.end() - from_lead, lead_keep.end());
+            trim_buf.insert(trim_buf.end(), pcm + first - from_chunk, pcm + n);
+            lead_keep.clear();
+        } else {
+            trim_buf.assign(pcm, pcm + n);
+        }
+        // 20 ms fade-in from the first shipped sample
+        const int done = kFadeIn - fade_left;
+        for (int i = 0; i < static_cast<int>(trim_buf.size()) && fade_left > 0; ++i, --fade_left) {
+            const float t = static_cast<float>(done + i) / kFadeIn;
+            trim_buf[i] *= t * t;
+        }
+        return ctl.emit_audio(trim_buf.data(), static_cast<int>(trim_buf.size()));
+    };
+    // Everything the loop delivers goes through here.
+    auto deliver = [&](const float* pcm24, int n, bool final_chunk) -> bool {
+        if (!use_pf) return n > 0 ? ship(pcm24, n) : true;
+        BenchScope bs(&bench, "postfilter");
+        pf_in.clear();
+        pf_out.clear();
+        if (n > 0) up2x.process(pcm24, n, &pf_in);
+        pf->process(pf_in.data(), static_cast<int>(pf_in.size()), &pf_out, final_chunk);
+        if (pf_out.empty()) return true;
+        return ship(pf_out.data(), static_cast<int>(pf_out.size()));
+    };
+
     auto advance_chunk = [&]() {
         if (lead_chunk > 0 && !sound_shipped) {
             if (pending_speech == 0) return;      // still the lead-in: hold the size
@@ -245,9 +320,7 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
         first_emit = false;
         frames_emitted = total;
         ++emits;
-        if (audio.size() > off)
-            return ctl.emit_audio(audio.data() + off, static_cast<int>(audio.size() - off));
-        return true;
+        return deliver(audio.data() + off, static_cast<int>(audio.size() - off), false);
     };
 
     // ---- text ----
@@ -404,6 +477,7 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
 
     if (!aborted) {
         if (!emit_pending(true)) aborted = true;
+        else if (use_pf && !deliver(nullptr, 0, true)) aborted = true;   // lookahead + overlap tail
     }
     if (bench_enabled()) {
         char title[128];

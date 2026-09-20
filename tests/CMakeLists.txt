@@ -27,6 +27,7 @@ vv_add_test(test_qwen2_resident)
 vv_add_test(test_sconv1d)
 vv_add_test(test_sconvt_streaming)
 vv_add_test(test_decoder_v2)
+vv_add_test(test_dfn_reference)
 vv_add_test(test_block1d)
 vv_add_test(test_acoustic)
 vv_add_test(test_diffusion_head)
@@ -57,7 +58,7 @@ if(VIBEVOICE_TEST_LARGE)
                          test_15b_smoke test_15b_closed_loop test_15b_multispeaker
                          PROPERTIES SKIP_RETURN_CODE 77)
 endif()
-set_tests_properties(test_tokenizer test_rope test_qwen2_block test_qwen2_resident
+set_tests_properties(test_dfn_reference test_tokenizer test_rope test_qwen2_block test_qwen2_resident
                      test_sconv1d test_sconvt_streaming test_block1d test_acoustic test_diffusion_head
                      test_dpm_solver test_load_realtime test_load_15b
                      test_e2e_tts test_e2e_asr

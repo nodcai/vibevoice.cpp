@@ -22,7 +22,7 @@ bool TtsStream::begin(VibeVoiceModel* model, const VibeVoiceTTSParams& p, TtsStr
     model_       = model;
     params_      = p;
     on_audio_    = std::move(on_audio);
-    sample_rate_ = model->cfg.sample_rate;
+    sample_rate_ = vibevoice_tts_output_sample_rate(*model, p);
     text_.clear();
     handed_out_ = 0;
     ended_ = done_ = false;

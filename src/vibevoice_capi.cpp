@@ -183,7 +183,7 @@ int vv_capi_tts(const char*        text,
     vv_audio audio_out{};
     audio_out.samples     = samples.data();
     audio_out.n_samples   = samples.size();
-    audio_out.sample_rate = 24000;
+    audio_out.sample_rate = vv::vibevoice_tts_output_sample_rate(*g.tts, p);
     audio_out.channels    = 1;
     return vv::save_wav_pcm16(dst_wav_path, audio_out);
 }
@@ -293,6 +293,8 @@ vv_capi_stream* vv_capi_stream_begin(const char*                  voice_path,
     tp.stream_first_chunk_frames = p->first_chunk_frames > 0 ? p->first_chunk_frames : 3;
     tp.stream_lead_chunk_frames  = p->lead_chunk_frames > 0 ? p->lead_chunk_frames : 0;
     tp.neg_condition_anchor      = p->neg_condition_anchor >= 0.0f ? p->neg_condition_anchor : 0.2f;
+    tp.postfilter                = p->no_postfilter == 0;
+    tp.trim_lead                 = p->no_trim == 0;
     auto* s = new vv_capi_stream();
     s->cb = on_audio;
     s->user = user;
