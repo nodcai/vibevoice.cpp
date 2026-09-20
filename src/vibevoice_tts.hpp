@@ -26,6 +26,7 @@
 //     voice the generated audio will be incoherent. The wiring is correct;
 //     a follow-up will add voice-cache loading.
 
+#include "acoustic_decoder_v2.hpp"
 #include "acoustic_tokenizer.hpp"
 #include "diffusion_head.hpp"
 #include "dpm_solver.hpp"
@@ -86,6 +87,10 @@ struct VibeVoiceWeights {
 
     // ---- acoustic decoder ----
     DecoderWeights at_dec;
+    // Re-laid weights for the stateful decoder (acoustic_decoder_v2),
+    // prepared lazily on first decode. mutable: the decode helpers take a
+    // const VibeVoiceWeights& and this is a derived cache, not a weight.
+    mutable DecoderV2Weights at_dec_v2;
 };
 
 // Per-layer KV cache stored on the CPU as raw float buffers. Each layer

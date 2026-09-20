@@ -1,4 +1,6 @@
 #include "vibevoice_tts.hpp"
+#include "acoustic_decoder_v2.hpp"
+#include "bench.hpp"
 #include "vibevoice_speech_helpers.hpp"
 #include "audio_io.hpp"
 #include "backend.hpp"
@@ -597,6 +599,15 @@ std::vector<float> decode_latent_sequence(const VibeVoiceConfig&  cfg,
                                           const float*            latents,
                                           int                     n_frames) {
     if (n_frames <= 0) return {};
+    if (decoder_v2_enabled() && decoder_v2_prepare(w.at_dec, cfg.acoustic, &w.at_dec_v2)) {
+        DecoderV2State st;
+        std::vector<float> out;
+        if (decoder_v2_state_init(w.at_dec_v2, &st) &&
+            decoder_v2_decode(w.at_dec_v2, st, latents, n_frames, &out)) {
+            return out;
+        }
+        VV_LOG_WARN("decoder_v2 failed; falling back to the legacy decoder graph");
+    }
     std::vector<float> packed = pack_latents_ggml_order(latents, n_frames, cfg.latent);
 
     // Backend-aware compute: build the graph in a no_alloc ctx, allocate
@@ -912,6 +923,12 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
     // through this cache so concatenating the emitted chunks is bit-exact vs a
     // single-shot decode_latent_sequence over the full latent trajectory.
     StreamingCache dec_cache;
+    DecoderV2State dec_v2;
+    const bool use_v2 = decoder_v2_enabled() &&
+                        decoder_v2_prepare(w.at_dec, cfg.acoustic, &w.at_dec_v2) &&
+                        decoder_v2_state_init(w.at_dec_v2, &dec_v2);
+    if (p.verbose) std::fprintf(stderr, "[tts] decoder: %s\n", use_v2 ? "v2 (stateful)" : "legacy streaming");
+    BenchTotals bench;
     int  decoded_frames  = 0;   // latent frames already decoded + emitted
     int  emitted_windows = 0;   // chunks handed to on_chunk so far
 
@@ -930,6 +947,7 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
                         sizeof(float) * hidden * win);
 
             // LM forward
+            BenchScope bs_text(&bench, "lm_text_window");
             std::vector<float> lm_hidden;
             if (!run_qwen2_stack(nullptr, cfg, w.lm_layers, /*output_norm=*/nullptr,
                                  lm_pos, win, emb_win.data(), &kv_lm,
@@ -968,10 +986,15 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
         if (use_cfg) {
             cond_neg.assign(neg_tlm_hidden_last.begin(), neg_tlm_hidden_last.end());
         }
-        if (dpm_solver_sample(z, cfg.latent, /*frames=*/1, /*batch=*/1,
-                              cond, hidden,
-                              w.dh, dh_cfg, solver_cfg, solver_state,
-                              cond_neg, p.cfg_scale) != 0) {
+        int dpm_rc = 0;
+        {
+            BenchScope bs(&bench, "diffusion");
+            dpm_rc = dpm_solver_sample(z, cfg.latent, /*frames=*/1, /*batch=*/1,
+                                       cond, hidden,
+                                       w.dh, dh_cfg, solver_cfg, solver_state,
+                                       cond_neg, p.cfg_scale);
+        }
+        if (dpm_rc != 0) {
             VV_LOG_ERROR("dpm_solver_sample failed at frame %d", frame);
             return -9;
         }
@@ -980,11 +1003,15 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
         all_latents.insert(all_latents.end(), z.begin(), z.end());
 
         // 5c. Project latent through connector → next-step embedding.
+        BenchClock bc_conn;
         auto ac_embed = run_speech_connector(cfg, w, z.data(), /*batch=*/1);
+        if (bench_enabled()) bench.add("connector", bc_conn.ms());
         // Add tts_input_types[0] (speech type)
         add_input_type_embedding(cfg, w, /*n_tokens=*/1, /*type=*/0, ac_embed.data());
 
         // 5d. Step TTS-LM by one position (positive branch).
+            {
+            BenchScope bs(&bench, "tlm_pos");
             if (!run_qwen2_stack(nullptr, cfg, w.tlm_layers, /*output_norm=*/w.tlm_output_norm,
                                  tlm_pos, /*n_new=*/1, ac_embed.data(), &kv_tlm,
                                  nullptr, &tlm_hidden_last)) {
@@ -992,8 +1019,10 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
                 return -10;
             }
             tlm_pos += 1;
+            }
 
             if (use_cfg) {
+                BenchScope bs(&bench, "tlm_neg");
                 std::vector<float> ac_embed_neg(ac_embed);
                 if (!run_qwen2_stack(nullptr, cfg, w.tlm_layers,
                                      /*output_norm=*/w.tlm_output_norm,
@@ -1005,7 +1034,9 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
                 neg_tlm_pos += 1;
             }
 
+            BenchClock bc_eos;
             const float eos = run_eos_classifier(cfg, w, tlm_hidden_last.data());
+            if (bench_enabled()) bench.add("eos", bc_eos.ms());
             if (p.verbose && (total_frames % 4 == 0 || eos > 0.5f)) {
                 std::fprintf(stderr, "[tts] frame %d: eos=%.3f, %d latents\n",
                              total_frames, eos,
@@ -1040,12 +1071,16 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
             const bool is_first = (emitted_windows == 0);
             const bool is_final = finished || (total_frames >= p.max_speech_frames);
             std::vector<float> win_audio;
-            if (!run_decoder_chunk_streaming(cfg, w, scaled.data(), new_frames,
-                                             dec_cache, is_first, is_final,
-                                             &win_audio)) {
-                VV_LOG_ERROR("run_decoder_chunk_streaming failed at frame %d",
-                             total_frames);
+            {
+            BenchScope bs(&bench, "decode");
+            const bool dec_ok = use_v2
+                ? decoder_v2_decode(w.at_dec_v2, dec_v2, scaled.data(), new_frames, &win_audio)
+                : run_decoder_chunk_streaming(cfg, w, scaled.data(), new_frames,
+                                              dec_cache, is_first, is_final, &win_audio);
+            if (!dec_ok) {
+                VV_LOG_ERROR("decoder failed at frame %d", total_frames);
                 return -11;
+            }
             }
             ++emitted_windows;
             decoded_frames = total_frames;
@@ -1066,6 +1101,12 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
         }
     }
 
+    if (bench_enabled()) {
+        char title[96];
+        std::snprintf(title, sizeof(title), "tts realtime: %d frames, %d windows, %d steps, backend %s",
+                      total_frames, emitted_windows, p.n_diffusion_steps, vv::backend_name());
+        bench.report(title);
+    }
     if (p.verbose) std::fprintf(stderr,
         "[tts] streaming done: %d frames in %d windows\n",
         total_frames, emitted_windows);

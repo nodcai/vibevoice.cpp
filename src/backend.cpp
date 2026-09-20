@@ -120,6 +120,14 @@ void init() {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
         g_gallocr = ggml_gallocr_new(buft);
         VV_LOG_INFO("backend: %s", g_name.c_str());
+        // Free our allocator + backend at exit, before the backend library's
+        // own static destructors run: ggml-metal asserts that no residency
+        // set is still alive when its device is torn down, and this handler
+        // (registered after that library initialised) runs first.
+        std::atexit([] {
+            if (g_gallocr) { ggml_gallocr_free(g_gallocr); g_gallocr = nullptr; }
+            if (g_backend) { ggml_backend_free(g_backend); g_backend = nullptr; }
+        });
     } else {
         VV_LOG_ERROR("backend: failed to initialize any backend");
         g_name = "none";

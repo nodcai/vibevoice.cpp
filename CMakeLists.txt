@@ -58,6 +58,7 @@ set(VIBEVOICE_SOURCES
     src/qwen2.cpp
     src/conv1d.cpp
     src/acoustic_tokenizer.cpp
+    src/acoustic_decoder_v2.cpp
     src/diffusion_head.cpp
     src/dpm_solver.cpp
     src/vibevoice_tts.cpp

@@ -1,8 +1,15 @@
-// Decoder chunked-vs-single-shot parity. Gated: needs a realtime-0.5b gguf via
-// VIBEVOICE_TTS_MODEL. Proves run_decoder_chunk_streaming == decode_latent_sequence.
+// Decoder parity on real weights. Gated: needs a realtime-0.5b gguf via
+// VIBEVOICE_TTS_MODEL. Compares the legacy chunked streaming decoder
+// (run_decoder_chunk_streaming) against decode_latent_sequence, which now
+// runs the stateful decoder_v2 when enabled - so this is the legacy-vs-v2
+// gate on real weights. CPU only: the legacy graph needs a left pad that
+// GPU backends do not implement.
 #include "vibevoice.h"
 #include "vibevoice_tts.hpp"
 #include "acoustic_tokenizer.hpp"
+#include "backend.hpp"
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +19,7 @@
 int main() {
     const char* model_env = std::getenv("VIBEVOICE_TTS_MODEL");
     if (!model_env || !*model_env) { std::fprintf(stderr, "skip: set VIBEVOICE_TTS_MODEL\n"); return 77; }
+    if (!ggml_backend_is_cpu(vv::backend())) { std::fprintf(stderr, "skip: legacy decoder graph is CPU-only\n"); return 77; }
     vv::VibeVoiceModel model;
     if (!vv::vibevoice_load(model_env, &model)) { std::fprintf(stderr, "FAIL: load\n"); return 1; }
     if (model.variant != "realtime-0.5b") { std::fprintf(stderr, "FAIL: want realtime-0.5b got %s\n", model.variant.c_str()); return 2; }
@@ -20,7 +28,10 @@ int main() {
     const int N = 48;  // frames (~6.4 s), multiple of the 6-frame window
     std::mt19937 rng(1234); std::normal_distribution<float> nd(0.f,1.f);
     std::vector<float> scaled((size_t)latent*N);
-    for (auto& v : scaled) v = nd(rng);
+    // Real scaled latents have std ~5 (raw/0.196 - bias). Unit-variance input
+    // decodes to near-silence where F16 accumulation noise dominates and the
+    // relative error is meaningless, so match the real scale.
+    for (auto& v : scaled) v = 5.0f * nd(rng);
 
     // Reference: single-shot decode. decode_latent_sequence takes per-frame
     // [latent] latents (frame-major, latent-fastest) and applies the ggml-order
