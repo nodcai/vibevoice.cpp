@@ -82,8 +82,11 @@ struct ResidentKV {
     std::vector<struct ggml_tensor*> v;   // same
     int                     max_seq  = 0;
     int                     past_len = 0;
+    ggml_type               type     = GGML_TYPE_F32;
 
-    bool init(int n_layers, int hd, int n_kv, int max_seq);
+    // `type` F16 halves the cache traffic; flash attention consumes the F16
+    // strided views directly, and the per-step ggml_cpy converts on write.
+    bool init(int n_layers, int hd, int n_kv, int max_seq, ggml_type type = GGML_TYPE_F32);
     void free();
     ~ResidentKV();
 };
@@ -125,6 +128,19 @@ struct Qwen2LayerOutputResident {
     struct ggml_tensor* k_write = nullptr;  // ggml_cpy result; expand-on-graph
     struct ggml_tensor* v_write = nullptr;
 };
+
+// Attention core shared by the layer builders and the fused TTS frame graph.
+//   q_p: [hd, n_tokens, n_h, B]      (permuted view is fine)
+//   k_p, v_p: [hd, kv_len, n_kv, B]  (permuted views of the resident cache;
+//             F16 views go to flash attention without a copy)
+//   mask: additive [kv_len, n_tokens] (F16 for the FA path) or null
+// Returns [n_h*hd, n_tokens*B], contiguous.
+struct ggml_tensor* qwen2_attention(struct ggml_context* ctx,
+                                    struct ggml_tensor*  q_p,
+                                    struct ggml_tensor*  k_p,
+                                    struct ggml_tensor*  v_p,
+                                    struct ggml_tensor*  mask,
+                                    const Qwen2Hparams&  hp);
 
 Qwen2LayerOutputResident qwen2_layer_forward_resident(
     struct ggml_context*     ctx,

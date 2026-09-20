@@ -1,6 +1,7 @@
 #include "vibevoice_tts.hpp"
 #include "acoustic_decoder_v2.hpp"
 #include "bench.hpp"
+#include "tts_frame_graph.hpp"
 #include "vibevoice_speech_helpers.hpp"
 #include "audio_io.hpp"
 #include "backend.hpp"
@@ -855,10 +856,17 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
     const int max_tlm_seq     = (p.voice ? p.voice->seq_tlm    : 0) + n_text + p.max_speech_frames + 32;
     const int max_neg_tlm_seq = (use_cfg ? p.voice->seq_neg_tlm : 0)         + p.max_speech_frames + 32;
 
+    // F16 caches: half the per-step attention traffic, and flash attention
+    // reads the F16 strided views directly instead of casting the whole
+    // history every frame. VIBEVOICE_KV_F32=1 restores F32 for A/B.
+    const ggml_type kv_type = [] {
+        const char* e = std::getenv("VIBEVOICE_KV_F32");
+        return (e && e[0] == '1') ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    }();
     ResidentKV kv_lm, kv_tlm, kv_neg_tlm;
-    if (!kv_lm.init (cfg.n_layers_lm,  hd, n_kv, max_lm_seq))  return -5;
-    if (!kv_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_tlm_seq)) return -5;
-    if (use_cfg && !kv_neg_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_neg_tlm_seq)) return -5;
+    if (!kv_lm.init (cfg.n_layers_lm,  hd, n_kv, max_lm_seq,  kv_type)) return -5;
+    if (!kv_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_tlm_seq, kv_type)) return -5;
+    if (use_cfg && !kv_neg_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_neg_tlm_seq, kv_type)) return -5;
 
     // Upload voice-prompt KV into the resident buffers. After this the
     // host-side voice->kv_* vectors are no longer touched - the resident
@@ -866,10 +874,19 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
     auto upload_kv = [hd, n_kv](ResidentKV& dst,
                                 const std::vector<LayerKV>& src,
                                 int seq_len) {
+        std::vector<ggml_fp16_t> tmp;
         for (size_t li = 0; li < src.size(); ++li) {
             const size_t per = static_cast<size_t>(hd) * n_kv * seq_len;
-            ggml_backend_tensor_set(dst.k[li], src[li].k.data(), 0, sizeof(float) * per);
-            ggml_backend_tensor_set(dst.v[li], src[li].v.data(), 0, sizeof(float) * per);
+            if (dst.type == GGML_TYPE_F16) {
+                tmp.resize(per);
+                for (size_t i = 0; i < per; ++i) tmp[i] = ggml_fp32_to_fp16(src[li].k[i]);
+                ggml_backend_tensor_set(dst.k[li], tmp.data(), 0, sizeof(ggml_fp16_t) * per);
+                for (size_t i = 0; i < per; ++i) tmp[i] = ggml_fp32_to_fp16(src[li].v[i]);
+                ggml_backend_tensor_set(dst.v[li], tmp.data(), 0, sizeof(ggml_fp16_t) * per);
+            } else {
+                ggml_backend_tensor_set(dst.k[li], src[li].k.data(), 0, sizeof(float) * per);
+                ggml_backend_tensor_set(dst.v[li], src[li].v.data(), 0, sizeof(float) * per);
+            }
         }
         dst.past_len = seq_len;
     };
@@ -929,6 +946,12 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
                         decoder_v2_state_init(w.at_dec_v2, &dec_v2);
     if (p.verbose) std::fprintf(stderr, "[tts] decoder: %s\n", use_v2 ? "v2 (stateful)" : "legacy streaming");
     BenchTotals bench;
+    const bool fused = fused_frame_enabled();
+    // tts_input_types[0] (speech) as a host row for the fused graph input.
+    std::vector<float> speech_type(static_cast<size_t>(hidden), 0.0f);
+    add_input_type_embedding(cfg, w, /*n_tokens=*/1, /*type=*/0, speech_type.data());
+    if (p.verbose) std::fprintf(stderr, "[tts] frame loop: %s, kv %s\n",
+                                fused ? "fused" : "unfused", ggml_type_name(kv_type));
     int  decoded_frames  = 0;   // latent frames already decoded + emitted
     int  emitted_windows = 0;   // chunks handed to on_chunk so far
 
@@ -977,6 +1000,32 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
         std::vector<float> z(cfg.latent);
         for (auto& v : z) v = norm(rng);
 
+        float eos = 0.0f;
+        if (fused) {
+            FusedFrameInputs fin;
+            fin.z0        = z.data();
+            fin.cond_pos  = tlm_hidden_last.data();
+            fin.cond_neg  = use_cfg ? neg_tlm_hidden_last.data() : nullptr;
+            fin.cfg_scale = p.cfg_scale;
+            fin.stype     = speech_type.data();
+            FusedFrameOutputs fout;
+            bool ok = false;
+            {
+                BenchScope bs(&bench, "fused_frame");
+                ok = run_fused_frame(cfg, w, dh_cfg, solver_cfg, solver_state,
+                                     kv_tlm, use_cfg ? &kv_neg_tlm : nullptr, fin, &fout, &bench);
+            }
+            if (!ok) {
+                VV_LOG_ERROR("fused frame failed at frame %d", frame);
+                return -9;
+            }
+            z = fout.latent;
+            all_latents.insert(all_latents.end(), z.begin(), z.end());
+            tlm_hidden_last = fout.hidden_pos;
+            tlm_pos += 1;
+            if (use_cfg) { neg_tlm_hidden_last = fout.hidden_neg; neg_tlm_pos += 1; }
+            eos = 1.0f / (1.0f + std::exp(-fout.eos_logit));
+        } else {
         std::vector<float> cond(static_cast<size_t>(hidden));
         std::memcpy(cond.data(), tlm_hidden_last.data(), sizeof(float) * hidden);
 
@@ -1035,8 +1084,9 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
             }
 
             BenchClock bc_eos;
-            const float eos = run_eos_classifier(cfg, w, tlm_hidden_last.data());
+            eos = run_eos_classifier(cfg, w, tlm_hidden_last.data());
             if (bench_enabled()) bench.add("eos", bc_eos.ms());
+        }  // unfused
             if (p.verbose && (total_frames % 4 == 0 || eos > 0.5f)) {
                 std::fprintf(stderr, "[tts] frame %d: eos=%.3f, %d latents\n",
                              total_frames, eos,
@@ -1101,6 +1151,14 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
         }
     }
 
+    // Debug aid: VIBEVOICE_DUMP_LATENTS=<path> writes every generated latent
+    // (raw f32, frame-major) so two runs can be compared frame by frame.
+    if (const char* dump = std::getenv("VIBEVOICE_DUMP_LATENTS")) {
+        if (FILE* f = std::fopen(dump, "wb")) {
+            std::fwrite(all_latents.data(), sizeof(float), all_latents.size(), f);
+            std::fclose(f);
+        }
+    }
     if (bench_enabled()) {
         char title[96];
         std::snprintf(title, sizeof(title), "tts realtime: %d frames, %d windows, %d steps, backend %s",

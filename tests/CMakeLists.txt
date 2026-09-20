@@ -44,13 +44,14 @@ if(VIBEVOICE_TEST_LARGE)
     vv_add_test(test_capi)
     vv_add_test(test_encoder_chunked_parity)
     vv_add_test(test_decoder_chunked_parity)
+    vv_add_test(test_fused_frame_parity)
     vv_add_test(test_generate_stream_parity)
     vv_add_test(test_capi_stream)
     vv_add_test(test_15b_smoke)
     vv_add_test(test_15b_closed_loop)
     vv_add_test(test_15b_multispeaker)
     set_tests_properties(test_closed_loop test_long_form_asr test_capi
-                         test_encoder_chunked_parity test_decoder_chunked_parity
+                         test_encoder_chunked_parity test_decoder_chunked_parity test_fused_frame_parity
                          test_generate_stream_parity test_capi_stream
                          test_15b_smoke test_15b_closed_loop test_15b_multispeaker
                          PROPERTIES SKIP_RETURN_CODE 77)

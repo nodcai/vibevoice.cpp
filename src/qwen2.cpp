@@ -132,54 +132,7 @@ Qwen2LayerOutput qwen2_layer_forward(struct ggml_context*     ctx,
     struct ggml_tensor* k_p = ggml_permute(ctx, k_full, 0, 2, 1, 3);
     struct ggml_tensor* v_p = ggml_permute(ctx, v_full, 0, 2, 1, 3);
 
-    const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-    struct ggml_tensor* o = nullptr;
-
-    if (hp.use_flash_attn) {
-        // Flash-attention path: never materializes the [seq_kv, seq_q, n_h]
-        // scores tensor - critical for long ASR prefixes (a 17-min audio is
-        // ~7500 tokens, scores would be 6 GB FP32 per layer in eager mode).
-        // Mask must be F16 + contiguous (ggml_flash_attn_ext contract).
-        //
-        // Cast K/V to F16: post-mul_mat they arrive as F32 (Q8_0 weights
-        // dequantize during the linear), and FA's HBM bandwidth on K/V
-        // dominates kernel time. F16 K/V halves that read traffic while
-        // softmax and the K@Q reduction itself stay F32 via FA's internal
-        // accumulator. Same trick llama.cpp uses for Qwen2.
-        struct ggml_tensor* k_fa = (k_p->type == GGML_TYPE_F32)
-                                   ? ggml_cast(ctx, k_p, GGML_TYPE_F16)
-                                   : k_p;
-        struct ggml_tensor* v_fa = (v_p->type == GGML_TYPE_F32)
-                                   ? ggml_cast(ctx, v_p, GGML_TYPE_F16)
-                                   : v_p;
-
-        // Output shape per ggml.c: {v->ne[0], q->ne[2], q->ne[1], q->ne[3]}
-        // = [hd, n_h, seq_q, b] - already in the post-permuted shape that
-        // the eager path needs ggml_permute(0,2,1,3) to get to. Skip the
-        // permute and collapse directly.
-        o = ggml_flash_attn_ext(ctx, q_p, k_fa, v_fa, mask,
-                                scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
-        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
-        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
-    } else {
-        // Eager path: scores = K^T @ Q  -> [seq_kv, seq_q, n_h, b].
-        // GQA broadcasting is handled inside ggml_mul_mat (n_h % n_kv == 0).
-        struct ggml_tensor* scores = ggml_mul_mat(ctx, k_p, q_p);
-        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-
-        // Scaled softmax with additive mask.
-        struct ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, /*max_bias=*/0.0f);
-
-        // For attn @ V we need V with shape [seq_kv, hd, n_kv, b].
-        struct ggml_tensor* v_t = maybe_cont(ctx, ggml_transpose(ctx, v_p));
-
-        // attn @ V -> [hd, seq_q, n_h, b]
-        o = ggml_mul_mat(ctx, v_t, attn);
-
-        // Permute [hd, seq, n_h] -> [hd, n_h, seq], then collapse to [hidden, seq].
-        o = ggml_permute(ctx, o, 0, 2, 1, 3);
-        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
-    }
+    struct ggml_tensor* o = qwen2_attention(ctx, q_p, k_p, v_p, mask, hp);
     if (n_batch > 1) {
         o = ggml_reshape_3d(ctx, o, n_h * hd, n_tokens, n_batch);
     }
@@ -202,9 +155,44 @@ Qwen2LayerOutput qwen2_layer_forward(struct ggml_context*     ctx,
     return out;
 }
 
+// qwen2_attention ------------------------------------------------------------
+
+struct ggml_tensor* qwen2_attention(struct ggml_context* ctx,
+                                    struct ggml_tensor*  q_p,
+                                    struct ggml_tensor*  k_p,
+                                    struct ggml_tensor*  v_p,
+                                    struct ggml_tensor*  mask,
+                                    const Qwen2Hparams&  hp) {
+    const int     hd       = hp.head_dim;
+    const int     n_h      = hp.n_heads;
+    const int64_t n_tokens = q_p->ne[1];
+    const int64_t n_batch  = q_p->ne[3] > 0 ? q_p->ne[3] : 1;
+    const float   scale    = 1.0f / std::sqrt(static_cast<float>(hd));
+    struct ggml_tensor* o = nullptr;
+    if (hp.use_flash_attn) {
+        struct ggml_tensor* k_fa = (k_p->type == GGML_TYPE_F32)
+                                   ? ggml_cast(ctx, k_p, GGML_TYPE_F16) : k_p;
+        struct ggml_tensor* v_fa = (v_p->type == GGML_TYPE_F32)
+                                   ? ggml_cast(ctx, v_p, GGML_TYPE_F16) : v_p;
+        o = ggml_flash_attn_ext(ctx, q_p, k_fa, v_fa, mask,
+                                scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+        ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
+    } else {
+        struct ggml_tensor* scores = ggml_mul_mat(ctx, k_p, q_p);
+        ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+        struct ggml_tensor* attn = ggml_soft_max_ext(ctx, scores, mask, scale, /*max_bias=*/0.0f);
+        struct ggml_tensor* v_t  = maybe_cont(ctx, ggml_transpose(ctx, v_p));
+        o = ggml_mul_mat(ctx, v_t, attn);
+        o = ggml_permute(ctx, o, 0, 2, 1, 3);
+        o = ggml_cont_2d(ctx, o, n_h * hd, n_tokens * n_batch);
+    }
+    return o;
+}
+
 // ResidentKV ----------------------------------------------------------------
 
-bool ResidentKV::init(int n_layers, int hd, int n_kv, int max_seq_in) {
+bool ResidentKV::init(int n_layers, int hd, int n_kv, int max_seq_in, ggml_type type_in) {
     free();
 
     struct ggml_init_params p {};
@@ -216,8 +204,8 @@ bool ResidentKV::init(int n_layers, int hd, int n_kv, int max_seq_in) {
     k.assign(n_layers, nullptr);
     v.assign(n_layers, nullptr);
     for (int i = 0; i < n_layers; ++i) {
-        k[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, max_seq_in, 1);
-        v[i] = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, n_kv, max_seq_in, 1);
+        k[i] = ggml_new_tensor_4d(ctx, type_in, hd, n_kv, max_seq_in, 1);
+        v[i] = ggml_new_tensor_4d(ctx, type_in, hd, n_kv, max_seq_in, 1);
         if (!k[i] || !v[i]) { free(); return false; }
     }
     buffer = vv::allocate_ctx_tensors(ctx);
@@ -225,6 +213,7 @@ bool ResidentKV::init(int n_layers, int hd, int n_kv, int max_seq_in) {
 
     max_seq  = max_seq_in;
     past_len = 0;
+    type     = type_in;
     return true;
 }
 
