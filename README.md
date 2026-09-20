@@ -101,6 +101,64 @@ python scripts/convert_voice_to_gguf.py --src /tmp/voice.pt --out models/voice.g
 This is the same roundtrip codified as `tests/test_closed_loop.cpp` - see
 [`docs/conversion.md`](docs/conversion.md) for how to wire it into ctest.
 
+## Streaming TTS, post-filter, single gguf (realtime-0.5B)
+
+The realtime model can speak while an LLM is still writing the reply.
+`vv::TtsStream` (C++) and `vv_capi_stream_*` (flat C ABI) take text as it
+is produced and hand back audio per chunk from a worker thread:
+
+```cpp
+vv::TtsStream st;
+st.begin(&model, params, [&](const float* pcm, int n) { play(pcm, n); });
+st.push_text("Hello there! ");      // as tokens arrive
+st.push_text("Welcome to the demo.");
+st.end();                           // no more text; join() waits for the tail
+```
+
+The first chunk is 3 latent frames (~400 ms of audio) and later chunks grow
+by three halves up to 32 frames, so each chunk plays longer than the next
+takes to make. On an M4 Max the first chunk arrives about 50-70 ms after the
+first five text tokens; a 6 s reply finishes in about 0.5 s.
+
+VibeVoice realtime occasionally puts a short musical artefact in front of
+utterances that open with phrases like "Welcome!" or "Hello there". The
+library removes it with a [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet)
+post-filter and then trims the lead-in silence, both inside the stream, so
+the caller only ever hears speech. The filter's weights ride inside the
+model file:
+
+```bash
+# once: the DeepFilterNet3 ONNX export as a 4 MB gguf
+# python scripts/convert_deepfilternet_to_gguf.py --input <DeepFilterNet3 dir> --output models/deepfilternet3.gguf
+python scripts/merge_dfn_gguf.py \
+  --model models/vibevoice-realtime-0.5B-q8_0.gguf \
+  --dfn   models/deepfilternet3.gguf \
+  --out   models/vibevoice-realtime-0.5b-dfn-q8_0.gguf
+# or at conversion time: convert_vibevoice_to_gguf.py ... --dfn models/deepfilternet3.gguf
+
+./build/bin/vibevoice-cli tts --model models/vibevoice-realtime-0.5b-dfn-q8_0.gguf \
+  --tokenizer models/tokenizer.gguf --voice models/voice-en-Emma.gguf \
+  --text "Welcome! This starts clean." --steps 3 --cfg 1.7 --stream --out hello.wav
+```
+
+With the filter present the output is 48 kHz (its native rate); ask
+`vibevoice_tts_output_sample_rate` / `vv_capi_stream_sample_rate` rather
+than assuming 24 kHz. `--no-postfilter` and `--no-trim` (and the matching
+params) switch either step off. Streaming and batch synthesis produce
+bit-identical audio for the same text and seed.
+
+Performance switches, all for A/B, default on: `VIBEVOICE_VAE_V2=0` restores
+the legacy conv-transpose decoder (CPU only), `VIBEVOICE_FUSED=0` the
+unfused per-step frame loop, `VIBEVOICE_KV_F32=1` F32 K/V caches.
+`VIBEVOICE_BENCH=1` prints per-phase timings.
+
+| Stage (M4 Max, Metal, q8_0, 3 steps, CFG 1.7) | before | now |
+|---|---:|---:|
+| Acoustic decoder per latent frame | did not run on Metal (legacy graph aborts; ~17 ms/frame on CPU) | 3 ms |
+| LM + diffusion per frame | 10.3 ms | 5 ms |
+| Time to first audio (streamed) | whole reply first | 50-70 ms |
+| 6.3 s reply, end to end | 4.6 s on CPU | 0.5 s |
+
 ## Quickstart - voice cloning (1.5B)
 
 The `microsoft/VibeVoice-1.5B` model conditions on a raw reference WAV

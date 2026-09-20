@@ -71,8 +71,10 @@ int vv_capi_tts(const char*        text,
                 uint32_t           seed);
 
 // Streaming counterpart of vv_capi_tts for the realtime-0.5B model. Each
-// decoded audio window is converted to 24 kHz mono signed-16-bit PCM and handed
-// to `on_pcm` as soon as it is produced. Concatenating every callback's samples
+// decoded audio chunk is converted to mono signed-16-bit PCM at
+// vv_capi_tts_sample_rate() (48 kHz when the loaded model carries the DFN3
+// post-filter, 24 kHz otherwise) and handed to `on_pcm` as soon as it is
+// produced. Concatenating every callback's samples
 // yields exactly the PCM that vv_capi_tts writes to a WAV for the same
 // text/voice/seed (same generate path, same float→int16 conversion).
 //
@@ -85,6 +87,10 @@ int vv_capi_tts(const char*        text,
 //
 // Realtime-0.5B only: returns -20 if a 1.5B model is loaded (unsupported).
 // Returns 0 on success, non-zero error code otherwise.
+// Sample rate vv_capi_tts writes and vv_capi_tts_stream delivers for the
+// loaded TTS model with default params; 0 if no TTS model is loaded.
+int vv_capi_tts_sample_rate(void);
+
 typedef int (*vv_pcm_cb)(const int16_t* samples, int n_samples, void* user);
 int vv_capi_tts_stream(const char* text,
                        const char* voice_path,

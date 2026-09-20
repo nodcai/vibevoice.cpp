@@ -188,6 +188,14 @@ int vv_capi_tts(const char*        text,
     return vv::save_wav_pcm16(dst_wav_path, audio_out);
 }
 
+int vv_capi_tts_sample_rate(void) {
+    auto& g = engine();
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.tts) return 0;
+    vv::VibeVoiceTTSParams p;
+    return vv::vibevoice_tts_output_sample_rate(*g.tts, p);
+}
+
 int vv_capi_tts_stream(const char* text,
                        const char* voice_path,
                        int         n_diffusion_steps,

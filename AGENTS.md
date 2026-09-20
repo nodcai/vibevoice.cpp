@@ -33,7 +33,16 @@ checkpoint and run them standalone.
 include/vibevoice.h          # public C API (purego / dlopen target)
 src/
   vibevoice.cpp              # public-API impl
-  vibevoice_tts.{hpp,cpp}    # TTS orchestrator (M5)
+  vibevoice_tts.{hpp,cpp}    # TTS load + shared helpers + 1.5B path
+  tts_realtime_loop.cpp      # realtime-0.5B loop: text windows, emit ramp,
+                             #   silence flush, post-filter + lead trim
+  tts_frame_graph.{hpp,cpp}  # one ggml graph per speech frame (DPM steps,
+                             #   CFG pair, connector, pos+neg TTS-LM, EOS)
+  vibevoice_stream.{hpp,cpp} # TtsStream: worker thread, incremental text
+  acoustic_decoder_v2.{hpp,cpp} # stateful σ-VAE decoder (mul_mat + overlap-add)
+  dfn.{hpp,cpp}, dfn_fast.*, dfn_fft.*  # DeepFilterNet3 post-filter
+  resample2x.{hpp,cpp}       # exact 2x upsampler for the filter
+  bench.hpp                  # VIBEVOICE_BENCH=1 per-phase timing
   vibevoice_asr.{hpp,cpp}    # ASR orchestrator (M6)
   qwen2.{hpp,cpp}            # Qwen2 transformer block + GQA + KV cache
   acoustic_tokenizer.{hpp,cpp}# VAE encoder + decoder
@@ -194,6 +203,33 @@ These bit us before. They will probably bite again.
    config means there's no final RMSNorm between the last conv stage
    and the head. Our loader sets `w.final_norm = nullptr` if the tensor
    is absent; the forward pass skips it.
+
+9. **Metal has no left pad and its `conv_transpose_1d` never returns for
+   the decoder's 3200x upsample.** The legacy `decoder_forward` graph only
+   runs on the CPU backend; everything real goes through
+   `acoustic_decoder_v2`, which is built from mul_mat, shifted views and
+   an in-graph overlap-add carry. Keep it that way when touching the
+   decoder.
+
+10. **Per-frame graphs must expand the resident K/V writes first.** In
+    `run_fused_frame` (and `run_qwen2_stack`) the `ggml_cpy` into the
+    resident cache is expanded before the attention that reads the cache
+    through a view; expanding the output first would order the read
+    before the write.
+
+11. **CPU matmul rounds activations to F16 for F16 weights and picks
+    different kernels for 1 vs 2 columns.** Fused-vs-unfused parity is
+    3e-7 on Metal and up to 1e-3 on CPU for that reason
+    (test_fused_frame_parity tolerates it). Do not chase it.
+
+12. **The latent-norm silence test needs an absolute floor.** Some voices
+    start speaking at frame 1; a threshold relative to the "lead-in"
+    then classes everything as silent. Floor 3.5, lead-relative only when
+    the lead is itself under the floor.
+
+13. **The post-filter changes the output rate to 48 kHz.** Anything that
+    writes or plays audio must ask `vibevoice_tts_output_sample_rate` /
+    `vv_capi_stream_sample_rate`.
 
 ## Adding a new test
 
