@@ -1,7 +1,7 @@
 #include "vibevoice_tts.hpp"
+#include "vibevoice_tts_internal.hpp"
 #include "acoustic_decoder_v2.hpp"
 #include "bench.hpp"
-#include "tts_frame_graph.hpp"
 #include "vibevoice_speech_helpers.hpp"
 #include "audio_io.hpp"
 #include "backend.hpp"
@@ -156,6 +156,8 @@ bool vibevoice_load(const std::string& path, VibeVoiceModel* out) {
         dhc.freq_size   = 256;
         if (!load_diffusion_head(m, "dh.", dhc, &w.dh)) return false;
         if (!load_decoder(m, "at.dec", c.acoustic, &w.at_dec)) return false;
+        if (decoder_v2_enabled() && !decoder_v2_prepare(w.at_dec, c.acoustic, &w.at_dec_v2))
+            VV_LOG_WARN("decoder_v2 unavailable for this model; the legacy decoder will be used");
     }
 
     if (is_15b) {
@@ -170,6 +172,8 @@ bool vibevoice_load(const std::string& path, VibeVoiceModel* out) {
         dhc.freq_size   = 256;
         if (!load_diffusion_head(m, "dh.", dhc, &w.dh)) return false;
         if (!load_decoder(m, "at.dec", c.acoustic, &w.at_dec)) return false;
+        if (decoder_v2_enabled() && !decoder_v2_prepare(w.at_dec, c.acoustic, &w.at_dec_v2))
+            VV_LOG_WARN("decoder_v2 unavailable for this model; the legacy decoder will be used");
         // Single LM stack: stash its final RMSNorm in tlm_output_norm so the
         // run_qwen2_stack call site can reuse the same hook the realtime path
         // uses for the upper stack.
@@ -353,7 +357,7 @@ bool vibevoice_voice_load(const std::string&    path,
 //  Inference
 // ============================================================================
 
-namespace {
+namespace detail {
 
 
 // Build & run one forward pass through a Qwen2 stack.
@@ -584,7 +588,8 @@ std::vector<float> pack_latents_ggml_order(const float* latents,
     return packed;
 }
 
-}  // namespace
+}  // namespace detail
+using namespace detail;
 
 // Decode a SEQUENCE of N speech latents into audio samples in a single
 // decoder pass. The decoder is causal — its convolutions need to see the
@@ -761,414 +766,6 @@ int vibevoice_tts_generate(VibeVoiceModel*           model,
             samples->insert(samples->end(), s, s + n);
             return true;
         });
-}
-
-int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
-                                     const std::string&        text,
-                                     const VibeVoiceTTSParams& p,
-                                     const vv_pcm_chunk_cb&    on_chunk) {
-    if (!model || !on_chunk) return -1;
-    if (model->variant == "1.5b") {
-        VV_LOG_ERROR("vibevoice_tts_generate_streaming: streaming is only "
-                     "supported for realtime-0.5b models");
-        return -1;
-    }
-
-    const auto& cfg = model->cfg;
-    const auto& w   = model->w;
-
-    // ---- 1. tokenize ----
-    if (!model->tokenizer.vocab_size()) {
-        VV_LOG_ERROR("vibevoice_tts_generate: tokenizer not loaded");
-        return -2;
-    }
-    // mlx-audio convention: append "\n" to terminate the user turn so the
-    // model knows the input is complete and starts the speech reply. The
-    // upstream voice prefix ends mid-conversation; without a separator, the
-    // model treats the new text as a continuation of the prior turn.
-    std::string text_with_sep = text;
-    while (!text_with_sep.empty() &&
-           (text_with_sep.back() == ' ' || text_with_sep.back() == '\t' ||
-            text_with_sep.back() == '\r' || text_with_sep.back() == '\n')) {
-        text_with_sep.pop_back();
-    }
-    text_with_sep += "\n";
-    const auto text_ids = model->tokenizer.encode(text_with_sep);
-    if (text_ids.empty()) {
-        VV_LOG_ERROR("tokenizer produced no tokens");
-        return -3;
-    }
-    if (p.verbose) {
-        std::fprintf(stderr, "[tts] %zu input text tokens\n", text_ids.size());
-    }
-
-    // ---- 2. embed text via lm.tok_embd ----
-    // tok_embd is [hidden, vocab_size] in ggml after gguf load. May be fp32
-    // or fp16 depending on the converter --dtype. Lives on the active
-    // backend's buffer, so each row is fetched via ggml_backend_tensor_get
-    // (a memcpy on CPU; a DtoH transfer on CUDA / Metal / Vulkan).
-    const int hidden = cfg.hidden;
-    const int n_text = static_cast<int>(text_ids.size());
-    std::vector<float> text_embeds(static_cast<size_t>(hidden) * n_text);
-
-    if (w.lm_tok_embd->type == GGML_TYPE_F32) {
-        const size_t row = sizeof(float) * hidden;
-        for (int t = 0; t < n_text; ++t) {
-            const int id = text_ids[t];
-            if (id < 0 || id >= cfg.vocab_size) {
-                VV_LOG_ERROR("token id out of range: %d", id);
-                return -5;
-            }
-            ggml_backend_tensor_get(w.lm_tok_embd, &text_embeds[hidden * t],
-                                    row * static_cast<size_t>(id), row);
-        }
-    } else if (w.lm_tok_embd->type == GGML_TYPE_F16) {
-        const size_t row = sizeof(ggml_fp16_t) * hidden;
-        std::vector<ggml_fp16_t> staged(hidden);
-        for (int t = 0; t < n_text; ++t) {
-            const int id = text_ids[t];
-            if (id < 0 || id >= cfg.vocab_size) {
-                VV_LOG_ERROR("token id out of range: %d", id);
-                return -5;
-            }
-            ggml_backend_tensor_get(w.lm_tok_embd, staged.data(),
-                                    row * static_cast<size_t>(id), row);
-            for (int i = 0; i < hidden; ++i) {
-                text_embeds[hidden * t + i] = ggml_fp16_to_fp32(staged[i]);
-            }
-        }
-    } else {
-        VV_LOG_ERROR("vibevoice_tts_generate: lm.tok_embd unsupported dtype %d",
-                     static_cast<int>(w.lm_tok_embd->type));
-        return -4;
-    }
-
-    // CFG parallel state probe (reads from voice prompt).
-    const bool use_cfg = p.voice && p.voice->has_neg && p.cfg_scale > 1.0f;
-
-    // Resident K/V caches. lm and tlm grow with text + (tlm only) speech
-    // frames. neg_tlm starts at the negative voice's seq_neg_tlm and
-    // grows by the same speech-frame count as tlm. We size for the
-    // pessimistic upper bound: voice prefix + n_text + max_speech_frames.
-    const int hd   = cfg.head_dim;
-    const int n_kv = cfg.n_kv_heads;
-    const int max_lm_seq      = (p.voice ? p.voice->seq_lm     : 0) + n_text                       + 32;
-    const int max_tlm_seq     = (p.voice ? p.voice->seq_tlm    : 0) + n_text + p.max_speech_frames + 32;
-    const int max_neg_tlm_seq = (use_cfg ? p.voice->seq_neg_tlm : 0)         + p.max_speech_frames + 32;
-
-    // F16 caches: half the per-step attention traffic, and flash attention
-    // reads the F16 strided views directly instead of casting the whole
-    // history every frame. VIBEVOICE_KV_F32=1 restores F32 for A/B.
-    const ggml_type kv_type = [] {
-        const char* e = std::getenv("VIBEVOICE_KV_F32");
-        return (e && e[0] == '1') ? GGML_TYPE_F32 : GGML_TYPE_F16;
-    }();
-    ResidentKV kv_lm, kv_tlm, kv_neg_tlm;
-    if (!kv_lm.init (cfg.n_layers_lm,  hd, n_kv, max_lm_seq,  kv_type)) return -5;
-    if (!kv_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_tlm_seq, kv_type)) return -5;
-    if (use_cfg && !kv_neg_tlm.init(cfg.n_layers_tlm, hd, n_kv, max_neg_tlm_seq, kv_type)) return -5;
-
-    // Upload voice-prompt KV into the resident buffers. After this the
-    // host-side voice->kv_* vectors are no longer touched - the resident
-    // tensors are the source of truth for the rest of the call.
-    auto upload_kv = [hd, n_kv](ResidentKV& dst,
-                                const std::vector<LayerKV>& src,
-                                int seq_len) {
-        std::vector<ggml_fp16_t> tmp;
-        for (size_t li = 0; li < src.size(); ++li) {
-            const size_t per = static_cast<size_t>(hd) * n_kv * seq_len;
-            if (dst.type == GGML_TYPE_F16) {
-                tmp.resize(per);
-                for (size_t i = 0; i < per; ++i) tmp[i] = ggml_fp32_to_fp16(src[li].k[i]);
-                ggml_backend_tensor_set(dst.k[li], tmp.data(), 0, sizeof(ggml_fp16_t) * per);
-                for (size_t i = 0; i < per; ++i) tmp[i] = ggml_fp32_to_fp16(src[li].v[i]);
-                ggml_backend_tensor_set(dst.v[li], tmp.data(), 0, sizeof(ggml_fp16_t) * per);
-            } else {
-                ggml_backend_tensor_set(dst.k[li], src[li].k.data(), 0, sizeof(float) * per);
-                ggml_backend_tensor_set(dst.v[li], src[li].v.data(), 0, sizeof(float) * per);
-            }
-        }
-        dst.past_len = seq_len;
-    };
-    if (p.voice) {
-        upload_kv(kv_lm,  p.voice->kv_lm,  p.voice->seq_lm);
-        upload_kv(kv_tlm, p.voice->kv_tlm, p.voice->seq_tlm);
-        if (use_cfg) upload_kv(kv_neg_tlm, p.voice->kv_neg_tlm, p.voice->seq_neg_tlm);
-    }
-
-    int                  lm_pos  = p.voice ? p.voice->seq_lm  : 0;
-    int                  tlm_pos = p.voice ? p.voice->seq_tlm : 0;
-    std::vector<float>   tlm_hidden_last = p.voice ? p.voice->tlm_last_hidden
-                                                   : std::vector<float>(hidden, 0.0f);
-    int                  neg_tlm_pos = use_cfg ? p.voice->seq_neg_tlm : 0;
-    std::vector<float>   neg_tlm_hidden_last = use_cfg ? p.voice->neg_tlm_last_hidden
-                                                       : std::vector<float>{};
-    if (p.verbose) std::fprintf(stderr, "[tts] cfg=%s (scale=%.2f)\n",
-                                use_cfg ? "on" : "off",
-                                static_cast<double>(p.cfg_scale));
-
-    // mlx-audio + upstream alternate text windows (5 tokens) with speech
-    // windows (6 frames). The model is trained on this pattern; processing
-    // all text up front then generating all speech misleads it.
-    constexpr int kTextWindow   = 5;
-    constexpr int kSpeechWindow = 6;
-
-    // ---- diffusion + RNG setup ----
-    DPMSolverConfig solver_cfg;
-    solver_cfg.num_train_timesteps = 1000;
-    solver_cfg.num_inference_steps = p.n_diffusion_steps;
-    solver_cfg.solver_order        = 2;
-    solver_cfg.lower_order_final   = true;
-    DPMSolverState solver_state;
-    dpm_solver_init(solver_cfg, &solver_state);
-
-    DiffusionHeadConfig dh_cfg;
-    dh_cfg.hidden      = hidden;
-    dh_cfg.latent      = cfg.latent;
-    dh_cfg.head_layers = cfg.head_layers;
-    dh_cfg.ffn_ratio   = cfg.ffn_ratio;
-    dh_cfg.eps         = cfg.rms_norm_eps;
-    dh_cfg.freq_size   = 256;
-
-    std::mt19937 rng(p.seed ? p.seed : std::random_device{}());
-    std::normal_distribution<float> norm(0.0f, 1.0f);
-
-    std::vector<float> all_latents;
-    all_latents.reserve(static_cast<size_t>(p.max_speech_frames) * cfg.latent);
-
-    // Shared decoder streaming state: each completed speech window is decoded
-    // through this cache so concatenating the emitted chunks is bit-exact vs a
-    // single-shot decode_latent_sequence over the full latent trajectory.
-    StreamingCache dec_cache;
-    DecoderV2State dec_v2;
-    const bool use_v2 = decoder_v2_enabled() &&
-                        decoder_v2_prepare(w.at_dec, cfg.acoustic, &w.at_dec_v2) &&
-                        decoder_v2_state_init(w.at_dec_v2, &dec_v2);
-    if (p.verbose) std::fprintf(stderr, "[tts] decoder: %s\n", use_v2 ? "v2 (stateful)" : "legacy streaming");
-    BenchTotals bench;
-    const bool fused = fused_frame_enabled();
-    // tts_input_types[0] (speech) as a host row for the fused graph input.
-    std::vector<float> speech_type(static_cast<size_t>(hidden), 0.0f);
-    add_input_type_embedding(cfg, w, /*n_tokens=*/1, /*type=*/0, speech_type.data());
-    if (p.verbose) std::fprintf(stderr, "[tts] frame loop: %s, kv %s\n",
-                                fused ? "fused" : "unfused", ggml_type_name(kv_type));
-    int  decoded_frames  = 0;   // latent frames already decoded + emitted
-    int  emitted_windows = 0;   // chunks handed to on_chunk so far
-
-    int  text_pos = 0;
-    bool finished = false;
-    int  total_frames = 0;
-
-    while (!finished && total_frames < p.max_speech_frames) {
-        // ---- text window (up to 5 tokens) ----
-        if (text_pos < n_text) {
-            const int win = std::min(kTextWindow, n_text - text_pos);
-            // Slice the text embeddings for this window.
-            std::vector<float> emb_win(static_cast<size_t>(hidden) * win);
-            std::memcpy(emb_win.data(),
-                        text_embeds.data() + static_cast<size_t>(hidden) * text_pos,
-                        sizeof(float) * hidden * win);
-
-            // LM forward
-            BenchScope bs_text(&bench, "lm_text_window");
-            std::vector<float> lm_hidden;
-            if (!run_qwen2_stack(nullptr, cfg, w.lm_layers, /*output_norm=*/nullptr,
-                                 lm_pos, win, emb_win.data(), &kv_lm,
-                                 &lm_hidden, nullptr)) return -6;
-            lm_pos += win;
-
-            // TTS-LM input = LM hidden + text-type embedding
-            std::vector<float> tlm_in = lm_hidden;
-            add_input_type_embedding(cfg, w, win, /*type=*/1, tlm_in.data());
-
-            if (!run_qwen2_stack(nullptr, cfg, w.tlm_layers,
-                                 /*output_norm=*/w.tlm_output_norm,
-                                 tlm_pos, win, tlm_in.data(), &kv_tlm,
-                                 nullptr, &tlm_hidden_last)) return -8;
-            tlm_pos += win;
-
-            text_pos += win;
-            if (p.verbose) std::fprintf(stderr,
-                "[tts] text window: %d/%d tokens consumed\n", text_pos, n_text);
-        }
-
-        // ---- speech window (up to 6 frames or until EOS) ----
-        const int sp_budget = std::min(kSpeechWindow, p.max_speech_frames - total_frames);
-        for (int sp = 0; sp < sp_budget; ++sp) {
-            const int frame = total_frames;
-        // 5a. Sample one speech latent from the diffusion head.
-        std::vector<float> z(cfg.latent);
-        for (auto& v : z) v = norm(rng);
-
-        float eos = 0.0f;
-        if (fused) {
-            FusedFrameInputs fin;
-            fin.z0        = z.data();
-            fin.cond_pos  = tlm_hidden_last.data();
-            fin.cond_neg  = use_cfg ? neg_tlm_hidden_last.data() : nullptr;
-            fin.cfg_scale = p.cfg_scale;
-            fin.stype     = speech_type.data();
-            FusedFrameOutputs fout;
-            bool ok = false;
-            {
-                BenchScope bs(&bench, "fused_frame");
-                ok = run_fused_frame(cfg, w, dh_cfg, solver_cfg, solver_state,
-                                     kv_tlm, use_cfg ? &kv_neg_tlm : nullptr, fin, &fout, &bench);
-            }
-            if (!ok) {
-                VV_LOG_ERROR("fused frame failed at frame %d", frame);
-                return -9;
-            }
-            z = fout.latent;
-            all_latents.insert(all_latents.end(), z.begin(), z.end());
-            tlm_hidden_last = fout.hidden_pos;
-            tlm_pos += 1;
-            if (use_cfg) { neg_tlm_hidden_last = fout.hidden_neg; neg_tlm_pos += 1; }
-            eos = 1.0f / (1.0f + std::exp(-fout.eos_logit));
-        } else {
-        std::vector<float> cond(static_cast<size_t>(hidden));
-        std::memcpy(cond.data(), tlm_hidden_last.data(), sizeof(float) * hidden);
-
-        // dpm_solver_sample expects shape [latent * frames * batch] with
-        // frames=1, B=1 here. cond shape: [hidden * 1 * 1].
-        std::vector<float> cond_neg;
-        if (use_cfg) {
-            cond_neg.assign(neg_tlm_hidden_last.begin(), neg_tlm_hidden_last.end());
-        }
-        int dpm_rc = 0;
-        {
-            BenchScope bs(&bench, "diffusion");
-            dpm_rc = dpm_solver_sample(z, cfg.latent, /*frames=*/1, /*batch=*/1,
-                                       cond, hidden,
-                                       w.dh, dh_cfg, solver_cfg, solver_state,
-                                       cond_neg, p.cfg_scale);
-        }
-        if (dpm_rc != 0) {
-            VV_LOG_ERROR("dpm_solver_sample failed at frame %d", frame);
-            return -9;
-        }
-
-        // 5b. Buffer this latent (decoder runs on the full sequence later).
-        all_latents.insert(all_latents.end(), z.begin(), z.end());
-
-        // 5c. Project latent through connector → next-step embedding.
-        BenchClock bc_conn;
-        auto ac_embed = run_speech_connector(cfg, w, z.data(), /*batch=*/1);
-        if (bench_enabled()) bench.add("connector", bc_conn.ms());
-        // Add tts_input_types[0] (speech type)
-        add_input_type_embedding(cfg, w, /*n_tokens=*/1, /*type=*/0, ac_embed.data());
-
-        // 5d. Step TTS-LM by one position (positive branch).
-            {
-            BenchScope bs(&bench, "tlm_pos");
-            if (!run_qwen2_stack(nullptr, cfg, w.tlm_layers, /*output_norm=*/w.tlm_output_norm,
-                                 tlm_pos, /*n_new=*/1, ac_embed.data(), &kv_tlm,
-                                 nullptr, &tlm_hidden_last)) {
-                VV_LOG_ERROR("TTS-LM speech step failed at frame %d", frame);
-                return -10;
-            }
-            tlm_pos += 1;
-            }
-
-            if (use_cfg) {
-                BenchScope bs(&bench, "tlm_neg");
-                std::vector<float> ac_embed_neg(ac_embed);
-                if (!run_qwen2_stack(nullptr, cfg, w.tlm_layers,
-                                     /*output_norm=*/w.tlm_output_norm,
-                                     neg_tlm_pos, /*n_new=*/1, ac_embed_neg.data(),
-                                     &kv_neg_tlm, nullptr, &neg_tlm_hidden_last)) {
-                    VV_LOG_ERROR("neg TTS-LM speech step failed at frame %d", frame);
-                    return -10;
-                }
-                neg_tlm_pos += 1;
-            }
-
-            BenchClock bc_eos;
-            eos = run_eos_classifier(cfg, w, tlm_hidden_last.data());
-            if (bench_enabled()) bench.add("eos", bc_eos.ms());
-        }  // unfused
-            if (p.verbose && (total_frames % 4 == 0 || eos > 0.5f)) {
-                std::fprintf(stderr, "[tts] frame %d: eos=%.3f, %d latents\n",
-                             total_frames, eos,
-                             static_cast<int>(all_latents.size() / cfg.latent));
-            }
-            ++total_frames;
-            if (eos > 0.5f) {
-                if (p.verbose) std::fprintf(stderr, "[tts] EOS at frame %d\n", frame);
-                finished = true;
-                break;
-            }
-        }
-
-        // ---- decode this speech window and emit it incrementally ----
-        // The LM loop above buffered `new_frames` fresh latents into
-        // all_latents. Decode exactly those through the shared cache so the
-        // caller hears audio as it's generated. is_final is set on the window
-        // that ends the run (EOS or frame cap) — the outer while exits right
-        // after, so this is the last chunk that reaches the decoder and gets
-        // the closing right-pad, matching the single-shot decode.
-        const int new_frames = total_frames - decoded_frames;
-        if (new_frames > 0) {
-            const size_t base = static_cast<size_t>(decoded_frames) * cfg.latent;
-            // scaled = latent / speech_scaling - speech_bias  (mlx-audio order);
-            // identical scaling to the former single-shot path, applied per
-            // window. Frame-major [new_frames * latent]; run_decoder_chunk_streaming
-            // applies the ggml-order packing internally.
-            std::vector<float> scaled(static_cast<size_t>(new_frames) * cfg.latent);
-            for (size_t i = 0; i < scaled.size(); ++i) {
-                scaled[i] = all_latents[base + i] / cfg.speech_scaling - cfg.speech_bias;
-            }
-            const bool is_first = (emitted_windows == 0);
-            const bool is_final = finished || (total_frames >= p.max_speech_frames);
-            std::vector<float> win_audio;
-            {
-            BenchScope bs(&bench, "decode");
-            const bool dec_ok = use_v2
-                ? decoder_v2_decode(w.at_dec_v2, dec_v2, scaled.data(), new_frames, &win_audio)
-                : run_decoder_chunk_streaming(cfg, w, scaled.data(), new_frames,
-                                              dec_cache, is_first, is_final, &win_audio);
-            if (!dec_ok) {
-                VV_LOG_ERROR("decoder failed at frame %d", total_frames);
-                return -11;
-            }
-            }
-            ++emitted_windows;
-            decoded_frames = total_frames;
-            if (p.verbose) std::fprintf(stderr,
-                "[tts] window %d: decoded %d frames -> %zu samples (final=%d)\n",
-                emitted_windows, new_frames, win_audio.size(), is_final ? 1 : 0);
-            if (!on_chunk(win_audio.data(), static_cast<int>(win_audio.size()))) {
-                if (p.verbose) std::fprintf(stderr,
-                    "[tts] on_chunk requested abort after %d frames\n", total_frames);
-                return 0;
-            }
-        }
-
-        // If we've consumed all text AND not finished, the outer loop will
-        // continue with empty-text iterations (just speech) until EOS or cap.
-        if (text_pos >= n_text && !finished) {
-            // No more text — keep generating speech until EOS or budget.
-        }
-    }
-
-    // Debug aid: VIBEVOICE_DUMP_LATENTS=<path> writes every generated latent
-    // (raw f32, frame-major) so two runs can be compared frame by frame.
-    if (const char* dump = std::getenv("VIBEVOICE_DUMP_LATENTS")) {
-        if (FILE* f = std::fopen(dump, "wb")) {
-            std::fwrite(all_latents.data(), sizeof(float), all_latents.size(), f);
-            std::fclose(f);
-        }
-    }
-    if (bench_enabled()) {
-        char title[96];
-        std::snprintf(title, sizeof(title), "tts realtime: %d frames, %d windows, %d steps, backend %s",
-                      total_frames, emitted_windows, p.n_diffusion_steps, vv::backend_name());
-        bench.report(title);
-    }
-    if (p.verbose) std::fprintf(stderr,
-        "[tts] streaming done: %d frames in %d windows\n",
-        total_frames, emitted_windows);
-    return 0;
 }
 
 // ============================================================================

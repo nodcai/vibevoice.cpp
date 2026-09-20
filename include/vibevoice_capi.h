@@ -95,6 +95,48 @@ int vv_capi_tts_stream(const char* text,
                        vv_pcm_cb   on_pcm,
                        void*       user);
 
+// ---- Streaming session (realtime-0.5B) ----------------------------------
+// Push text while it is being produced and receive audio per chunk from a
+// worker thread. `on_audio` runs on that thread; `pcm` is valid only for the
+// duration of the call. One session at a time per process: the worker owns
+// the engine while it runs, so do not call vv_capi_tts / vv_capi_asr until
+// vv_capi_stream_done() reports true or the session was freed.
+typedef struct vv_capi_stream vv_capi_stream;
+typedef void (*vv_audio_cb)(const float* pcm, int n_samples, void* user);
+
+typedef struct {
+    int      n_diffusion_steps;    /* 0 -> 20 */
+    float    cfg_scale;            /* 0 -> 1.3 (1.0 disables CFG) */
+    int      max_speech_frames;    /* 0 -> 200 (~27 s) */
+    int      max_text_tokens;      /* 0 -> 1024 */
+    uint32_t seed;                 /* 0 -> random */
+    int      first_chunk_frames;   /* 0 -> 3; the dominant term in time-to-first-audio */
+    int      lead_chunk_frames;    /* 0 -> off; hold this size until a chunk carried speech */
+    float    neg_condition_anchor; /* < 0 -> 0.2; CFG negative-path anchor blend, 0..1 */
+} vv_capi_stream_params;
+
+// Fills `p` with the defaults above (all zero / -1 means "default").
+void vv_capi_stream_default_params(vv_capi_stream_params* p);
+
+// Starts a session with the loaded TTS model. `voice_path` may be NULL if a
+// voice was given to vv_capi_load. Returns NULL on failure.
+vv_capi_stream* vv_capi_stream_begin(const char*                  voice_path,
+                                     const vv_capi_stream_params* p,
+                                     vv_audio_cb                  on_audio,
+                                     void*                        user);
+// Append UTF-8 text. Non-blocking. Returns 0, or -1 after end().
+int  vv_capi_stream_push_text(vv_capi_stream* s, const char* utf8);
+// No more text. Non-blocking; the worker drains and finishes.
+int  vv_capi_stream_end(vv_capi_stream* s);
+// Stop as soon as possible; no further audio is delivered.
+void vv_capi_stream_abort(vv_capi_stream* s);
+// Non-zero once the worker has finished (all audio delivered or aborted).
+int  vv_capi_stream_done(vv_capi_stream* s);
+// Sample rate of the delivered chunks.
+int  vv_capi_stream_sample_rate(vv_capi_stream* s);
+// end() if needed, join the worker, release the session.
+void vv_capi_stream_free(vv_capi_stream* s);
+
 // Transcribe `src_wav_path` into a JSON string written into the caller-
 // owned `out_json` buffer of size `out_capacity`. The JSON is the same
 // shape the model produces, e.g.

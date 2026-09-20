@@ -5,7 +5,10 @@
 #include "tokenizer.hpp"
 #include "vibevoice.h"
 #include "vibevoice_asr.hpp"
+#include "vibevoice_stream.hpp"
 #include "vibevoice_tts.hpp"
+
+#include <chrono>
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +45,10 @@ void print_usage(const char* argv0) {
         "  --out <path>        output WAV path (default: out.wav)\n"
         "  --max-frames N      cap speech frames (default 200)\n"
         "  --steps N           DPM-Solver inference steps (default 20)\n"
+        "  --stream            push the text word by word through the streaming\n"
+        "                      session and report the chunk timeline\n"
+        "  --first-chunk N     first streamed chunk in latent frames (default 3)\n"
+        "  --lead-chunk N      hold the chunk at N frames through the lead-in (0 = off)\n"
         "  --cfg X             classifier-free guidance scale (default 1.3,\n"
         "                      1.0 disables CFG)\n"
         "  --seed N            RNG seed for noise (default random)\n"
@@ -88,6 +95,8 @@ int cmd_tts(int argc, char** argv) {
     float cfg_scale = 1.3f;
     uint32_t seed = 0;
     bool  verbose = false;
+    bool  stream = false;
+    int   first_chunk = 0, lead_chunk = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -103,6 +112,9 @@ int cmd_tts(int argc, char** argv) {
         else if (a == "--seed"       && (i + 1 < argc)) { seed       = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10)); }
         else if (a == "--cfg"        && (i + 1 < argc)) { cfg_scale = static_cast<float>(std::atof(argv[++i])); }
         else if (a == "--verbose")                       { verbose = true; }
+        else if (a == "--stream")                        { stream = true; }
+        else if (a == "--first-chunk" && (i + 1 < argc)) { first_chunk = std::atoi(argv[++i]); }
+        else if (a == "--lead-chunk"  && (i + 1 < argc)) { lead_chunk  = std::atoi(argv[++i]); }
         else if (a == "-h" || a == "--help") {
             std::fprintf(stderr, "see `%s help`\n", argv[0]); return 0;
         }
@@ -190,11 +202,42 @@ int cmd_tts(int argc, char** argv) {
     p.seed              = seed;
     p.verbose           = verbose;
 
+    if (first_chunk > 0) p.stream_first_chunk_frames = first_chunk;
+    if (lead_chunk  > 0) p.stream_lead_chunk_frames  = lead_chunk;
+
     std::vector<float> samples;
-    int rc = vv::vibevoice_tts_generate(&model, text, p, &samples);
-    if (rc != 0) {
-        std::fprintf(stderr, "tts: generate failed (rc=%d)\n", rc);
-        return 4;
+    if (stream) {
+        if (!have_voice) { std::fprintf(stderr, "tts: --stream needs --voice\n"); return 4; }
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        int n_chunks = 0;
+        vv::TtsStream st;
+        if (!st.begin(&model, p, [&](const float* pcm, int n) {
+                const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+                std::fprintf(stderr, "tts: chunk %2d at %7.1f ms: %6d samples (%.2f s audio so far)\n",
+                             n_chunks, ms, n, static_cast<double>(samples.size() + n) / model.cfg.sample_rate);
+                samples.insert(samples.end(), pcm, pcm + n);
+                ++n_chunks;
+            })) { std::fprintf(stderr, "tts: stream begin failed\n"); return 4; }
+        // Push word by word, the way an LLM would deliver it.
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t ws = text.find(' ', pos);
+            if (ws == std::string::npos) ws = text.size(); else ++ws;
+            st.push_text(text.substr(pos, ws - pos));
+            pos = ws;
+        }
+        st.end();
+        st.join();
+        const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        std::fprintf(stderr, "tts: stream done in %.1f ms, %d chunks, rc=%d\n", ms, n_chunks, st.result());
+        if (st.result() != 0) return 4;
+    } else {
+        int rc = vv::vibevoice_tts_generate(&model, text, p, &samples);
+        if (rc != 0) {
+            std::fprintf(stderr, "tts: generate failed (rc=%d)\n", rc);
+            return 4;
+        }
     }
     std::fprintf(stderr, "tts: generated %zu samples (%.2fs at %d Hz)\n",
                  samples.size(),

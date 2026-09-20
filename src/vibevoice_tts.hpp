@@ -166,11 +166,37 @@ struct VibeVoiceTTSParams {
     std::vector<std::string> ref_audio_paths;
 
     int      max_speech_frames = 200;
+    // Streaming: how many text tokens the caches are sized for when the text
+    // is not known up front (TtsStream). The batch path sizes from its text.
+    int      max_text_tokens   = 1024;
     float    cfg_scale         = 1.3f;
     int      n_diffusion_steps = 20;
     uint32_t seed              = 0;
     bool     verbose           = false;
+
+    // ---- realtime loop tuning (see tts_realtime_loop.cpp) ----
+    int   stream_first_chunk_frames = 3;   // first emitted chunk, latent frames (~133 ms each)
+    int   stream_lead_chunk_frames  = 0;   // hold this size until a chunk carried speech; 0 = off
+    int   stream_max_chunk_frames   = 32;  // growth cap
+    float neg_condition_anchor      = 0.2f;// CFG negative path: blend of the post-prefill snapshot
+    bool  flush_on_silence          = true;// emit pending audio once the latents have gone silent
+    bool  trim_decoder_warmup       = true;// drop the decoder's 100 ms zero-state transient
 };
+
+// Text source + audio sink for the realtime loop. `pull_text` blocks until it
+// can return at least one token or sets *eof; it may return fewer than asked.
+// `emit_audio` returns false to stop generation. `should_abort` is optional.
+struct TtsStreamCtl {
+    std::function<void(int max_tokens, std::vector<int32_t>* out, bool* eof)> pull_text;
+    std::function<bool(const float* pcm, int n_samples)>                      emit_audio;
+    std::function<bool()>                                                     should_abort;
+};
+
+// The realtime-0.5b loop itself. Both vibevoice_tts_generate_streaming and
+// TtsStream are thin wrappers around it.
+int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
+                               const VibeVoiceTTSParams& p,
+                               const TtsStreamCtl&       ctl);
 
 // Generate audio for `text`. Dispatches on `model->variant`:
 //   * realtime-0.5b -> uses `p.voice` (pre-baked voice gguf state).

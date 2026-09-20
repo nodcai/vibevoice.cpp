@@ -63,6 +63,8 @@ set(VIBEVOICE_SOURCES
     src/dpm_solver.cpp
     src/vibevoice_tts.cpp
     src/tts_frame_graph.cpp
+    src/tts_realtime_loop.cpp
+    src/vibevoice_stream.cpp
     src/vibevoice_asr.cpp
 )
 

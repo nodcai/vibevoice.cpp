@@ -9,6 +9,7 @@
 #include "audio_io.hpp"
 #include "common.hpp"
 #include "vibevoice_asr.hpp"
+#include "vibevoice_stream.hpp"
 #include "vibevoice_tts.hpp"
 
 #include <algorithm>
@@ -245,6 +246,92 @@ int vv_capi_tts_stream(const char* text,
         return rc;
     }
     return 0;
+}
+
+void vv_capi_stream_default_params(vv_capi_stream_params* p) {
+    if (!p) return;
+    std::memset(p, 0, sizeof(*p));
+    p->neg_condition_anchor = -1.0f;
+}
+
+}  // extern "C"
+
+struct vv_capi_stream {
+    vv::TtsStream st;
+    vv_audio_cb   cb   = nullptr;
+    void*         user = nullptr;
+};
+
+extern "C" {
+
+vv_capi_stream* vv_capi_stream_begin(const char*                  voice_path,
+                                     const vv_capi_stream_params* p,
+                                     vv_audio_cb                  on_audio,
+                                     void*                        user) {
+    auto& g = engine();
+    std::lock_guard<std::mutex> lk(g.mu);
+    if (!g.tts || !on_audio) return nullptr;
+    if (g.tts->variant == "1.5b") {
+        VV_LOG_ERROR("vv_capi_stream_begin: streaming unsupported for 1.5b model");
+        return nullptr;
+    }
+    if (voice_path && voice_path[0] && !ensure_voice_loaded(g, voice_path)) return nullptr;
+    if (!g.voice) {
+        VV_LOG_ERROR("vv_capi_stream_begin: no voice loaded");
+        return nullptr;
+    }
+    vv_capi_stream_params d;
+    vv_capi_stream_default_params(&d);
+    if (!p) p = &d;
+    vv::VibeVoiceTTSParams tp;
+    tp.voice                     = g.voice.get();
+    tp.n_diffusion_steps         = p->n_diffusion_steps > 0 ? p->n_diffusion_steps : 20;
+    tp.cfg_scale                 = p->cfg_scale > 0.0f ? p->cfg_scale : 1.3f;
+    tp.max_speech_frames         = p->max_speech_frames > 0 ? p->max_speech_frames : 200;
+    tp.max_text_tokens           = p->max_text_tokens > 0 ? p->max_text_tokens : 1024;
+    tp.seed                      = p->seed;
+    tp.stream_first_chunk_frames = p->first_chunk_frames > 0 ? p->first_chunk_frames : 3;
+    tp.stream_lead_chunk_frames  = p->lead_chunk_frames > 0 ? p->lead_chunk_frames : 0;
+    tp.neg_condition_anchor      = p->neg_condition_anchor >= 0.0f ? p->neg_condition_anchor : 0.2f;
+    auto* s = new vv_capi_stream();
+    s->cb = on_audio;
+    s->user = user;
+    if (!s->st.begin(g.tts.get(), tp, [s](const float* pcm, int n) { s->cb(pcm, n, s->user); })) {
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+int vv_capi_stream_push_text(vv_capi_stream* s, const char* utf8) {
+    if (!s || !utf8) return -2;
+    if (s->st.done()) return -1;
+    s->st.push_text(utf8);
+    return 0;
+}
+
+int vv_capi_stream_end(vv_capi_stream* s) {
+    if (!s) return -2;
+    s->st.end();
+    return 0;
+}
+
+void vv_capi_stream_abort(vv_capi_stream* s) {
+    if (s) s->st.abort();
+}
+
+int vv_capi_stream_done(vv_capi_stream* s) {
+    return (!s || s->st.done()) ? 1 : 0;
+}
+
+int vv_capi_stream_sample_rate(vv_capi_stream* s) {
+    return s ? s->st.sample_rate() : 0;
+}
+
+void vv_capi_stream_free(vv_capi_stream* s) {
+    if (!s) return;
+    s->st.join();
+    delete s;
 }
 
 int vv_capi_asr(const char* src_wav_path,
