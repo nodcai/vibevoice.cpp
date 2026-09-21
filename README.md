@@ -101,6 +101,28 @@ python scripts/convert_voice_to_gguf.py --src /tmp/voice.pt --out models/voice.g
 This is the same roundtrip codified as `tests/test_closed_loop.cpp` - see
 [`docs/conversion.md`](docs/conversion.md) for how to wire it into ctest.
 
+## Quickstart - one file (realtime-0.5B with post-filter and tokenizer)
+
+[`nodcai/VibeVoice-Realtime-0.5B-DFN`](https://huggingface.co/nodcai/VibeVoice-Realtime-0.5B-DFN)
+carries the realtime model with the DeepFilterNet3 post-filter and the
+tokenizer embedded, in two quantizations, plus a voice:
+
+```bash
+hf download nodcai/VibeVoice-Realtime-0.5B-DFN --local-dir models
+./build/bin/vibevoice-cli tts \
+  --model models/vibevoice-realtime-0.5b-dfn-q4_k.gguf \
+  --voice models/vibevoice-voice-en-Nora_woman.gguf \
+  --text "Welcome! This starts clean." --steps 3 --cfg 1.7 --stream --out hello.wav
+```
+
+| file | size | notes |
+|---|---:|---|
+| `vibevoice-realtime-0.5b-dfn-q4_k.gguf` | 667 MB | q4_k LM, q6_k decoder FFN, q4_0 embedding; same word error rate as q8_0 |
+| `vibevoice-realtime-0.5b-dfn-q8_0.gguf` | 1.1 GB | q8_0 throughout; decoder waveform within 1% of F16 |
+
+No `--tokenizer` is needed; the output is 48 kHz. The sections below explain
+what is inside and how to build such a file yourself.
+
 ## Streaming TTS, post-filter, single gguf (realtime-0.5B)
 
 The realtime model can speak while an LLM is still writing the reply.
