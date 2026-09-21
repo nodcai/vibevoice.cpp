@@ -141,6 +141,23 @@ python scripts/merge_dfn_gguf.py \
   --text "Welcome! This starts clean." --steps 3 --cfg 1.7 --stream --out hello.wav
 ```
 
+For a smaller file, quantize from a full-precision conversion before
+merging. The LM layers are only 380 MB of the model; the acoustic decoder's
+FFN matrices (604 MB at F16) and an unused 272 MB TTS-LM embedding table are
+where the bytes go:
+
+```bash
+./build/bin/vibevoice-quantize --src models/vibevoice-realtime-0.5B.gguf \
+  --out models/vibevoice-realtime-0.5b-q8_0.gguf \
+  --type q8_0 --decoder-ffn-type q8_0 --head-type q8_0
+```
+
+That is 1.1 GB instead of 1.7 GB with the same word error rate and speed;
+the q8_0 decoder FFN changes the waveform by under 1%. Quantizing the LM
+below q8_0 (`--type q4_k`) costs intelligibility (word error rate 4% to 21%
+on a 24-sentence set) and gains no speed, and a q4_k decoder FFN changes the
+waveform by ~10%.
+
 With the filter present the output is 48 kHz (its native rate); ask
 `vibevoice_tts_output_sample_rate` / `vv_capi_stream_sample_rate` rather
 than assuming 24 kHz. `--no-postfilter` and `--no-trim` (and the matching
