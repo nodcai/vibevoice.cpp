@@ -109,7 +109,9 @@ int vv_capi_load(const char* tts_model_path,
             VV_LOG_ERROR("vv_capi_load: TTS model load failed: %s", tts_model_path);
             return -3;
         }
-        if (m->tokenizer.vocab_size() == 0) {
+        if (m->tokenizer.vocab_size() > 0) {
+            if (have_tok) VV_LOG_WARN("vv_capi_load: TTS model embeds its tokenizer; ignoring tokenizer_path %s", tokenizer_path);
+        } else {
             if (!have_tok) { VV_LOG_ERROR("vv_capi_load: TTS model has no embedded tokenizer; tokenizer_path required"); return -7; }
             if (!m->tokenizer.load_from_file(tokenizer_path)) {
                 VV_LOG_ERROR("vv_capi_load: TTS tokenizer load failed: %s", tokenizer_path);
@@ -125,7 +127,9 @@ int vv_capi_load(const char* tts_model_path,
             VV_LOG_ERROR("vv_capi_load: ASR model load failed: %s", asr_model_path);
             return -3;
         }
-        if (m->tokenizer.vocab_size() == 0) {
+        if (m->tokenizer.vocab_size() > 0) {
+            if (have_tok) VV_LOG_WARN("vv_capi_load: ASR model embeds its tokenizer; ignoring tokenizer_path %s", tokenizer_path);
+        } else {
             if (!have_tok) { VV_LOG_ERROR("vv_capi_load: ASR model has no embedded tokenizer; tokenizer_path required"); return -7; }
             if (!m->tokenizer.load_from_file(tokenizer_path)) {
                 VV_LOG_ERROR("vv_capi_load: ASR tokenizer load failed: %s", tokenizer_path);
