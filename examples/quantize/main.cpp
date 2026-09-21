@@ -108,6 +108,8 @@ int main(int argc, char** argv) {
     std::string src, out, type_str = "q4_k";
     std::string attn_type_str, ffn_type_str, lm_head_type_str;
     bool include_embed = false;
+    bool keep_tlm_embed = false;
+    std::string dec_ffn_type_str, head_type_str;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--src"           && i + 1 < argc) src              = argv[++i];
@@ -117,6 +119,9 @@ int main(int argc, char** argv) {
         else if (a == "--ffn-type"      && i + 1 < argc) ffn_type_str     = argv[++i];
         else if (a == "--lm-head-type"  && i + 1 < argc) lm_head_type_str = argv[++i];
         else if (a == "--include-embed")                  include_embed = true;
+        else if (a == "--keep-tlm-embed")                 keep_tlm_embed = true;
+        else if (a == "--decoder-ffn-type" && i + 1 < argc) dec_ffn_type_str = argv[++i];
+        else if (a == "--head-type"        && i + 1 < argc) head_type_str    = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::fprintf(stderr,
                 "usage: %s --src in.gguf --out out.gguf --type <type>\n"
@@ -130,7 +135,14 @@ int main(int argc, char** argv) {
                 "                         sensitive — for the 1.5B path, e.g.\n"
                 "                         --type q5_k --lm-head-type q8_0 lifts closed-loop\n"
                 "                         recall from 22%% to ~78%%.\n"
-                "  --include-embed   also quantize lm.tok_embd.weight (default: keep at source dtype)\n",
+                "  --include-embed   also quantize lm.tok_embd.weight (default: keep at source dtype)\n"
+                "  --decoder-ffn-type <type>  quantize the acoustic decoder's FFN matrices\n"
+                "                         (at.dec.*.ffn_linear[12]); default: keep. They are 600 MB\n"
+                "                         of the realtime model at F16, q8_0 halves that.\n"
+                "  --head-type <type>     quantize the diffusion head's matrices (dh.*); default: keep\n"
+                "  --keep-tlm-embed  keep tlm.tok_embd.weight. The TTS-LM only ever receives\n"
+                "                         input embeddings, so its 272 MB table is unused and\n"
+                "                         dropped by default.\n",
                 argv[0]);
             return 0;
         }
@@ -155,6 +167,10 @@ int main(int argc, char** argv) {
     const ggml_type attn_target    = resolve_override(attn_type_str,    "--attn-type");
     const ggml_type ffn_target     = resolve_override(ffn_type_str,     "--ffn-type");
     const ggml_type lm_head_target = resolve_override(lm_head_type_str, "--lm-head-type");
+    const bool      quant_dec_ffn  = !dec_ffn_type_str.empty();
+    const bool      quant_head     = !head_type_str.empty();
+    const ggml_type dec_ffn_target = quant_dec_ffn ? resolve_override(dec_ffn_type_str, "--decoder-ffn-type") : target;
+    const ggml_type head_target    = quant_head    ? resolve_override(head_type_str,    "--head-type")        : target;
 
     if (ggml_quantize_requires_imatrix(target)) {
         std::fprintf(stderr,
@@ -210,7 +226,18 @@ int main(int argc, char** argv) {
         bytes_in += in_size;
 
         const std::string sname = name;
+        if (sname == "tlm.tok_embd.weight" && !keep_tlm_embed) {
+            std::fprintf(stderr, "drop %s (unused by the TTS-LM, %.0f MB)\n", name, in_size / 1e6);
+            continue;
+        }
         ggml_type tensor_target = target;
+        bool extra_quant = false;   // decoder FFN / diffusion head, opted in
+        {
+            static const auto dec_ffn = std::regex(R"(^at\.dec\.stage_\d+_block_\d+\.weight\.ffn_linear[12]$)");
+            static const auto dh_mat  = std::regex(R"(^dh\.(noisy_proj|cond_proj|t_embed_lin[12]|final\.(proj|adaln)|layer_\d+\.(ffn_gate|ffn_up|ffn_down|adaln))$)");
+            if (quant_dec_ffn && std::regex_match(sname, dec_ffn)) { tensor_target = dec_ffn_target; extra_quant = true; }
+            else if (quant_head && std::regex_match(sname, dh_mat)) { tensor_target = head_target; extra_quant = true; }
+        }
         if (sname == "lm_head.weight") {
             tensor_target = lm_head_target;
         } else {
@@ -221,8 +248,28 @@ int main(int argc, char** argv) {
             if (std::regex_match(sname, blk_attn))      tensor_target = attn_target;
             else if (std::regex_match(sname, blk_ffn))  tensor_target = ffn_target;
         }
+        const bool wantq   = extra_quant || should_quantize(name, include_embed);
+        // K-quants need rows divisible by 256; this model's hidden size is
+        // 896, so most matmul weights are not. Fall back per tensor the way
+        // llama.cpp does (q2_k/q3_k -> q4_0, q4_k -> q5_0, q5_k -> q5_1,
+        // q6_k -> q8_0) instead of leaving the tensor at full precision.
+        if (wantq && st->ne[0] % ggml_blck_size(tensor_target) != 0) {
+            ggml_type fb = tensor_target;
+            switch (tensor_target) {
+                case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: fb = GGML_TYPE_Q4_0; break;
+                case GGML_TYPE_Q4_K:                      fb = GGML_TYPE_Q5_0; break;
+                case GGML_TYPE_Q5_K:                      fb = GGML_TYPE_Q5_1; break;
+                case GGML_TYPE_Q6_K:                      fb = GGML_TYPE_Q8_0; break;
+                default: break;
+            }
+            if (fb != tensor_target && st->ne[0] % ggml_blck_size(fb) == 0) {
+                std::fprintf(stderr, "fallback %s [ne0=%lld] %s -> %s (row not divisible by %d)\n",
+                             name, static_cast<long long>(st->ne[0]), ggml_type_name(tensor_target),
+                             ggml_type_name(fb), ggml_blck_size(tensor_target));
+                tensor_target = fb;
+            }
+        }
         const int blk      = ggml_blck_size(tensor_target);
-        const bool wantq   = should_quantize(name, include_embed);
         const bool can_quant = (st->ne[0] % blk == 0);
         const bool do_quant  = wantq && can_quant;
         if (wantq && !can_quant) {
