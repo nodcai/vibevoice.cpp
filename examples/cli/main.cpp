@@ -32,7 +32,7 @@ void print_usage(const char* argv0) {
         "\n"
         "tts options:\n"
         "  --model <path>      path to vibevoice gguf (required)\n"
-        "  --tokenizer <path>  path to tokenizer.gguf (required)\n"
+        "  --tokenizer <path>  tokenizer.gguf (not needed when the model embeds it)\n"
         "  --voice <path>      pre-baked voice.gguf — use with realtime-0.5B\n"
         "                      models. Mutually exclusive with --ref-audio.\n"
         "  --ref-audio <path>  reference WAV (24 kHz mono, ~5 s) — runtime\n"
@@ -58,7 +58,7 @@ void print_usage(const char* argv0) {
         "\n"
         "asr options:\n"
         "  --model <path>      path to vibevoice-asr.gguf (required)\n"
-        "  --tokenizer <path>  path to tokenizer.gguf (required)\n"
+        "  --tokenizer <path>  tokenizer.gguf (not needed when the model embeds it)\n"
         "  --audio <path>      path to input WAV (required, mono ≥16 kHz)\n"
         "  --max-new-tokens N  cap generated tokens (default 256)\n"
         "  --verbose           print encoder + decode stats\n"
@@ -130,8 +130,8 @@ int cmd_tts(int argc, char** argv) {
         }
     }
 
-    if (model_path.empty() || tok_path.empty()) {
-        std::fprintf(stderr, "tts: --model and --tokenizer are required\n");
+    if (model_path.empty()) {
+        std::fprintf(stderr, "tts: --model is required\n");
         return 1;
     }
     if (!voice_path.empty() && !ref_audio.empty()) {
@@ -156,8 +156,13 @@ int cmd_tts(int argc, char** argv) {
         return 2;
     }
 
-    std::fprintf(stderr, "vibevoice-cli tts: loading tokenizer %s\n", tok_path.c_str());
-    if (!model.tokenizer.load_from_file(tok_path)) {
+    if (!tok_path.empty()) std::fprintf(stderr, "vibevoice-cli tts: loading tokenizer %s\n", tok_path.c_str());
+    if (model.tokenizer.vocab_size() > 0) {
+        if (!tok_path.empty()) std::fprintf(stderr, "note: model embeds its tokenizer; --tokenizer ignored\n");
+    } else if (tok_path.empty()) {
+        std::fprintf(stderr, "error: this model has no embedded tokenizer; pass --tokenizer\n");
+        return 3;
+    } else if (!model.tokenizer.load_from_file(tok_path)) {
         std::fprintf(stderr, "tts: failed to load tokenizer\n");
         return 3;
     }
@@ -302,7 +307,12 @@ int cmd_asr(int argc, char** argv) {
         std::fprintf(stderr, "asr: failed to load model\n");
         return 3;
     }
-    if (!model.tokenizer.load_from_file(tok_path)) {
+    if (model.tokenizer.vocab_size() > 0) {
+        if (!tok_path.empty()) std::fprintf(stderr, "note: model embeds its tokenizer; --tokenizer ignored\n");
+    } else if (tok_path.empty()) {
+        std::fprintf(stderr, "error: this model has no embedded tokenizer; pass --tokenizer\n");
+        return 3;
+    } else if (!model.tokenizer.load_from_file(tok_path)) {
         std::fprintf(stderr, "asr: failed to load tokenizer\n");
         return 4;
     }

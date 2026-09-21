@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     std::string attn_type_str, ffn_type_str, lm_head_type_str;
     bool include_embed = false;
     bool keep_tlm_embed = false;
-    std::string dec_ffn_type_str, head_type_str;
+    std::string dec_ffn_type_str, head_type_str, embed_type_str, fallback_type_str;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if      (a == "--src"           && i + 1 < argc) src              = argv[++i];
@@ -122,6 +122,8 @@ int main(int argc, char** argv) {
         else if (a == "--keep-tlm-embed")                 keep_tlm_embed = true;
         else if (a == "--decoder-ffn-type" && i + 1 < argc) dec_ffn_type_str = argv[++i];
         else if (a == "--head-type"        && i + 1 < argc) head_type_str    = argv[++i];
+        else if (a == "--embed-type"       && i + 1 < argc) embed_type_str   = argv[++i];
+        else if (a == "--fallback-type"    && i + 1 < argc) fallback_type_str = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::fprintf(stderr,
                 "usage: %s --src in.gguf --out out.gguf --type <type>\n"
@@ -140,6 +142,11 @@ int main(int argc, char** argv) {
                 "                         (at.dec.*.ffn_linear[12]); default: keep. They are 600 MB\n"
                 "                         of the realtime model at F16, q8_0 halves that.\n"
                 "  --head-type <type>     quantize the diffusion head's matrices (dh.*); default: keep\n"
+                "  --embed-type <type>    quantize lm.tok_embd.weight (272 MB at F16) to a\n"
+                "                         block-32 type (q8_0 / q5_0 / q4_0); the runtime\n"
+                "                         dequantizes rows on lookup\n"
+                "  --fallback-type <type> type for rows a k-quant cannot cover (default:\n"
+                "                         q5_0 for q4_k, q5_1 for q5_k, q8_0 for q6_k, q4_0 below)\n"
                 "  --keep-tlm-embed  keep tlm.tok_embd.weight. The TTS-LM only ever receives\n"
                 "                         input embeddings, so its 272 MB table is unused and\n"
                 "                         dropped by default.\n",
@@ -169,6 +176,14 @@ int main(int argc, char** argv) {
     const ggml_type lm_head_target = resolve_override(lm_head_type_str, "--lm-head-type");
     const bool      quant_dec_ffn  = !dec_ffn_type_str.empty();
     const bool      quant_head     = !head_type_str.empty();
+    const bool      quant_embed    = !embed_type_str.empty();
+    const ggml_type embed_target   = quant_embed ? resolve_override(embed_type_str, "--embed-type") : target;
+    const bool      have_fallback  = !fallback_type_str.empty();
+    const ggml_type fallback_type  = have_fallback ? resolve_override(fallback_type_str, "--fallback-type") : target;
+    if (quant_embed && ggml_blck_size(embed_target) != 32) {
+        std::fprintf(stderr, "--embed-type must be a block-32 type (q8_0 / q5_0 / q5_1 / q4_0 / q4_1)\n");
+        return 1;
+    }
     const ggml_type dec_ffn_target = quant_dec_ffn ? resolve_override(dec_ffn_type_str, "--decoder-ffn-type") : target;
     const ggml_type head_target    = quant_head    ? resolve_override(head_type_str,    "--head-type")        : target;
 
@@ -237,6 +252,7 @@ int main(int argc, char** argv) {
             static const auto dh_mat  = std::regex(R"(^dh\.(noisy_proj|cond_proj|t_embed_lin[12]|final\.(proj|adaln)|layer_\d+\.(ffn_gate|ffn_up|ffn_down|adaln))$)");
             if (quant_dec_ffn && std::regex_match(sname, dec_ffn)) { tensor_target = dec_ffn_target; extra_quant = true; }
             else if (quant_head && std::regex_match(sname, dh_mat)) { tensor_target = head_target; extra_quant = true; }
+            else if (quant_embed && sname == "lm.tok_embd.weight")  { tensor_target = embed_target; extra_quant = true; }
         }
         if (sname == "lm_head.weight") {
             tensor_target = lm_head_target;
@@ -255,6 +271,7 @@ int main(int argc, char** argv) {
         // q6_k -> q8_0) instead of leaving the tensor at full precision.
         if (wantq && st->ne[0] % ggml_blck_size(tensor_target) != 0) {
             ggml_type fb = tensor_target;
+            if (have_fallback) fb = fallback_type; else
             switch (tensor_target) {
                 case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: fb = GGML_TYPE_Q4_0; break;
                 case GGML_TYPE_Q4_K:                      fb = GGML_TYPE_Q5_0; break;

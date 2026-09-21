@@ -67,10 +67,7 @@ int vv_capi_load(const char* tts_model_path,
     auto& g = engine();
     std::lock_guard<std::mutex> lk(g.mu);
 
-    if (!tokenizer_path || !tokenizer_path[0]) {
-        VV_LOG_ERROR("vv_capi_load: tokenizer_path is required");
-        return -2;
-    }
+    const bool have_tok = tokenizer_path && tokenizer_path[0];
     if ((!tts_model_path || !tts_model_path[0]) &&
         (!asr_model_path || !asr_model_path[0])) {
         VV_LOG_ERROR("vv_capi_load: at least one of tts_model_path or asr_model_path is required");
@@ -94,9 +91,12 @@ int vv_capi_load(const char* tts_model_path,
             VV_LOG_ERROR("vv_capi_load: TTS model load failed: %s", tts_model_path);
             return -3;
         }
-        if (!m->tokenizer.load_from_file(tokenizer_path)) {
-            VV_LOG_ERROR("vv_capi_load: TTS tokenizer load failed: %s", tokenizer_path);
-            return -7;
+        if (m->tokenizer.vocab_size() == 0) {
+            if (!have_tok) { VV_LOG_ERROR("vv_capi_load: TTS model has no embedded tokenizer; tokenizer_path required"); return -7; }
+            if (!m->tokenizer.load_from_file(tokenizer_path)) {
+                VV_LOG_ERROR("vv_capi_load: TTS tokenizer load failed: %s", tokenizer_path);
+                return -7;
+            }
         }
         g.tts = std::move(m);
     }
@@ -107,9 +107,12 @@ int vv_capi_load(const char* tts_model_path,
             VV_LOG_ERROR("vv_capi_load: ASR model load failed: %s", asr_model_path);
             return -3;
         }
-        if (!m->tokenizer.load_from_file(tokenizer_path)) {
-            VV_LOG_ERROR("vv_capi_load: ASR tokenizer load failed: %s", tokenizer_path);
-            return -7;
+        if (m->tokenizer.vocab_size() == 0) {
+            if (!have_tok) { VV_LOG_ERROR("vv_capi_load: ASR model has no embedded tokenizer; tokenizer_path required"); return -7; }
+            if (!m->tokenizer.load_from_file(tokenizer_path)) {
+                VV_LOG_ERROR("vv_capi_load: ASR tokenizer load failed: %s", tokenizer_path);
+                return -7;
+            }
         }
         g.asr = std::move(m);
     }

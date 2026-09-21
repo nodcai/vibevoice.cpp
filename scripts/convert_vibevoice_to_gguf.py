@@ -228,6 +228,9 @@ def main() -> int:
     # element-wise mul in the orchestrator until the loader pre-casts
     # norm/bias tensors.
     ap.add_argument("--dtype", choices=["fp16", "fp32"], default="fp32")
+    ap.add_argument("--tokenizer", default=None,
+                    help="tokenizer gguf (convert_tokenizer.py output) whose tokenizer.* keys are "
+                         "embedded, so the runtime needs no separate tokenizer file")
     ap.add_argument("--dfn", default=None,
                     help="deepfilternet3 gguf whose dfn.* tensors and keys are appended, "
                          "so the runtime can run the DFN3 post-filter from this one file "
@@ -366,6 +369,20 @@ def main() -> int:
     # speech scaling factors (also written as tensors above; surface as floats too)
     for n, arr in tensors:
         w.add_tensor(n, arr)
+
+    # ------- optional embedded tokenizer -------
+    if args.tokenizer:
+        tok = gguf.GGUFReader(args.tokenizer)
+        if "tokenizer.tokens" not in tok.fields:
+            sys.stderr.write("error: --tokenizer has no tokenizer.tokens key\n")
+            return 2
+        for name, field in tok.fields.items():
+            if not name.startswith("tokenizer."):
+                continue
+            if field.types[0] == gguf.GGUFValueType.ARRAY:
+                w.add_array(name, field.contents())
+            else:
+                w.add_key_value(name, field.contents(), field.types[0])
 
     # ------- optional DFN3 post-filter -------
     n_dfn = 0

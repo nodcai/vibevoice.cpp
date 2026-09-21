@@ -28,7 +28,8 @@ extern "C" {
 // Loads the engine. Either or both model paths can be NULL:
 //   tts_model_path  - realtime-0.5b gguf, required for vv_capi_tts.
 //   asr_model_path  - asr-7b gguf,        required for vv_capi_asr.
-//   tokenizer_path  - tokenizer gguf,     required for either.
+//   tokenizer_path  - tokenizer gguf; may be NULL when the model file
+//                     embeds its tokenizer (merge_dfn_gguf.py --tokenizer).
 //   voice_path      - voice gguf,         required for vv_capi_tts.
 //                     Multiple voices: re-call with a different path,
 //                     or pass NULL here and a per-call voice path to

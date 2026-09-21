@@ -74,6 +74,11 @@ bool vibevoice_load(const std::string& path, VibeVoiceModel* out) {
     out->variant = m.get_str("vibevoice.variant", "realtime-0.5b");
     if (dfn_model_present(m) && !dfn_model_load(m, &out->dfn))
         VV_LOG_WARN("post-filter tensors present but unusable; continuing without it");
+    // Embedded tokenizer (merge_dfn_gguf.py --tokenizer / converter --tokenizer).
+    if (!m.get_str("tokenizer.model").empty()) {
+        if (out->tokenizer.load(m)) VV_LOG_INFO("tokenizer: embedded, %zu tokens", out->tokenizer.vocab_size());
+        else VV_LOG_WARN("embedded tokenizer present but unusable; pass a tokenizer gguf");
+    }
     const bool is_asr      = (out->variant == "asr-7b");
     const bool is_realtime = (out->variant == "realtime-0.5b");
     const bool is_15b      = (out->variant == "1.5b");

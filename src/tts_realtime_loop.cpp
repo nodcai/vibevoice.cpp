@@ -85,8 +85,21 @@ bool embed_tokens(const VibeVoiceModel& m, const int32_t* ids, int n, std::vecto
         }
         return true;
     }
-    VV_LOG_ERROR("lm.tok_embd unsupported dtype %d", static_cast<int>(te->type));
-    return false;
+    // Quantized table (block-32 types keep rows self-contained): dequantize
+    // each looked-up row through the type traits.
+    const auto* tt = ggml_get_type_traits(te->type);
+    if (!tt || !tt->to_float || hidden % ggml_blck_size(te->type) != 0) {
+        VV_LOG_ERROR("lm.tok_embd unsupported dtype %s", ggml_type_name(te->type));
+        return false;
+    }
+    const size_t row = ggml_row_size(te->type, hidden);
+    std::vector<uint8_t> raw(row);
+    for (int t = 0; t < n; ++t) {
+        if (ids[t] < 0 || ids[t] >= m.cfg.vocab_size) return false;
+        ggml_backend_tensor_get(te, raw.data(), row * static_cast<size_t>(ids[t]), row);
+        tt->to_float(raw.data(), out->data() + static_cast<size_t>(hidden) * t, hidden);
+    }
+    return true;
 }
 
 }  // namespace
