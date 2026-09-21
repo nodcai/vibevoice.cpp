@@ -38,6 +38,24 @@ GlobalEngine& engine() {
     return g;
 }
 
+// Release the models before the backend goes away. Registered after the
+// first successful load, i.e. after the backend registered its own atexit,
+// so this runs first: model buffers, then the backend, then ggml's device
+// (ggml-metal asserts if buffers are still resident when its device is
+// freed). A host that calls vv_capi_unload itself makes this a no-op.
+void register_unload_at_exit() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::atexit([] {
+            auto& g = engine();
+            std::lock_guard<std::mutex> lk(g.mu);
+            g.voice.reset();
+            g.tts.reset();
+            g.asr.reset();
+        });
+    });
+}
+
 bool ensure_voice_loaded(GlobalEngine& g, const char* voice_path) {
     if (!voice_path || !voice_path[0]) return g.voice != nullptr;
     if (g.voice && g.voice_path_loaded == voice_path) return true;
@@ -120,6 +138,7 @@ int vv_capi_load(const char* tts_model_path,
     if (voice_path && voice_path[0]) {
         if (!ensure_voice_loaded(g, voice_path)) return -3;
     }
+    register_unload_at_exit();
     return 0;
 }
 
