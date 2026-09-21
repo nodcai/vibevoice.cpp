@@ -155,7 +155,7 @@ the bytes go:
   --type q4_k --fallback-type q4_0 --decoder-ffn-type q6_k --embed-type q4_0 --head-type q8_0
 python scripts/merge_dfn_gguf.py --model models/vibevoice-realtime-0.5b-q4_k.gguf \
   --dfn models/deepfilternet3.gguf --tokenizer models/tokenizer.gguf \
-  --out models/vibevoice-realtime-0.5b-dfn-q8_0.gguf
+  --out models/vibevoice-realtime-0.5b-dfn-q4_k.gguf
 ```
 
 Measured on 12 sentences x 6 seeds (Emma voice, 3 steps, CFG 1.7), word
