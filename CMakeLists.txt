@@ -44,7 +44,9 @@ endif()
 if(VIBEVOICE_GGML_HIPBLAS)
     set(GGML_HIPBLAS ON CACHE BOOL "" FORCE)
 endif()
-add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
+if(NOT TARGET ggml)
+    add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
+endif()
 
 # ---------- libvibevoice ----------
 set(VIBEVOICE_SOURCES
