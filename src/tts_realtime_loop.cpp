@@ -242,11 +242,12 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
     }
     // ---- lead trim: runs on what the listener would hear (post-filtered) ----
     // The model puts digital silence in front of every reply (~150-800 ms),
-    // or an artefact the post-filter turns into silence. Drop it until the
-    // onset, keep 20 ms ahead of the onset so it is not a step, fade in 20 ms.
+    // or an artefact the post-filter turns into silence or a faint hiss
+    // (around -60 dBFS, up to a second). Drop it until the onset, keep 60 ms
+    // ahead of the onset so a soft attack is not cut, fade in 20 ms.
     const int   out_rate      = use_pf ? model->dfn.sample_rate : cfg.sample_rate;
-    const float kSilence      = 1e-3f;                 // ~-60 dBFS; the lead is < -90, speech ~-16
-    const int   kKeepAhead    = 20 * out_rate / 1000;
+    const float kOnset        = 1e-2f;                 // -40 dBFS; speech gets there within ~50 ms
+    const int   kKeepAhead    = 60 * out_rate / 1000;
     const int   kFadeIn       = 20 * out_rate / 1000;
     const int   kLeadMax      = 1500 * out_rate / 1000;  // never swallow more than this
     int   lead_dropped = 0;
@@ -260,7 +261,7 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
         trim_buf.clear();
         if (!lead_done) {
             int first = 0;
-            while (first < n && std::fabs(pcm[first]) < kSilence) ++first;
+            while (first < n && std::fabs(pcm[first]) < kOnset) ++first;
             if (first >= n && lead_dropped + n <= kLeadMax) {
                 // still the lead: retain it (for the keep-ahead, and so a reply
                 // that never rises above the floor is delivered as silence at
