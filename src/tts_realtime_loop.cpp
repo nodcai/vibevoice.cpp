@@ -47,7 +47,34 @@
 #include <string>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
+
 namespace vv {
+
+namespace {
+// Runs its scope at utility QoS, which puts it on the efficiency cores of
+// Apple chips. The post-filter costs about a fifth of the energy there and
+// still runs ~40x faster than real time. A thread that is already at
+// utility or below is left as it is.
+struct UtilityQos {
+#if defined(__APPLE__)
+    qos_class_t prev = QOS_CLASS_UNSPECIFIED;
+    int         rel  = 0;
+    bool        set  = false;
+    UtilityQos() {
+        pthread_get_qos_class_np(pthread_self(), &prev, &rel);
+        if (prev == QOS_CLASS_UTILITY || prev == QOS_CLASS_BACKGROUND) return;
+        set = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) == 0;
+    }
+    ~UtilityQos() {
+        if (set) pthread_set_qos_class_self_np(prev == QOS_CLASS_UNSPECIFIED ? QOS_CLASS_DEFAULT : prev, rel);
+    }
+#endif
+};
+}  // namespace
 
 int vibevoice_tts_output_sample_rate(const VibeVoiceModel& model, const VibeVoiceTTSParams& p) {
     return (p.postfilter && model.dfn.ready) ? model.dfn.sample_rate : model.cfg.sample_rate;
@@ -297,8 +324,11 @@ int vibevoice_tts_run_realtime(VibeVoiceModel*           model,
         BenchScope bs(&bench, "postfilter");
         pf_in.clear();
         pf_out.clear();
-        if (n > 0) up2x.process(pcm24, n, &pf_in);
-        pf->process(pf_in.data(), static_cast<int>(pf_in.size()), &pf_out, final_chunk);
+        {
+            UtilityQos qos;
+            if (n > 0) up2x.process(pcm24, n, &pf_in);
+            pf->process(pf_in.data(), static_cast<int>(pf_in.size()), &pf_out, final_chunk);
+        }
         if (pf_out.empty()) return true;
         return ship(pf_out.data(), static_cast<int>(pf_out.size()));
     };
