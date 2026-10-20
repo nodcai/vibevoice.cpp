@@ -69,8 +69,9 @@ void TtsStream::join() {
 }
 
 void TtsStream::worker() {
+    const Tokenizer::EncodeOptions enc = tts_encode_options(params_);
     TtsStreamCtl ctl;
-    ctl.pull_text = [this](int max_tokens, std::vector<int32_t>* out, bool* eof) {
+    ctl.pull_text = [this, enc](int max_tokens, std::vector<int32_t>* out, bool* eof) {
         std::unique_lock<std::mutex> lk(mu_);
         for (;;) {
             // Tokenize the whole accumulated text up to the stable cut, so the
@@ -81,13 +82,13 @@ void TtsStream::worker() {
                 std::string t = text_;
                 while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n'))
                     t.pop_back();
-                if (!t.empty()) toks = model_->tokenizer.encode(t + "\n");
+                if (!t.empty()) toks = model_->tokenizer.encode(t + "\n", enc);
             } else {
                 // Cut AT the last whitespace, not after it: the space merges
                 // into the next word's token once that word arrives.
                 const size_t ws = text_.find_last_of(" \t\n");
                 if (ws != std::string::npos && ws > 0)
-                    toks = model_->tokenizer.encode(text_.substr(0, ws));
+                    toks = model_->tokenizer.encode(text_.substr(0, ws), enc);
             }
             if (handed_out_ < toks.size()) {
                 const size_t n = std::min(toks.size() - handed_out_, static_cast<size_t>(std::max(1, max_tokens)));

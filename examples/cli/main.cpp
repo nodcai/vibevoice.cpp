@@ -49,6 +49,10 @@ void print_usage(const char* argv0) {
         "                      session and report the chunk timeline\n"
         "  --no-postfilter     skip the DFN3 post-filter even if the model carries it\n"
         "  --no-trim           keep the model's lead-in silence\n"
+        "  --merge-id-cap N    refuse BPE merges whose token id is >= N (default 80000,\n"
+        "                      0 = off); rare single-token words mispronounce\n"
+        "  --no-canonical-first-word\n"
+        "                      keep the plain encoding of a text-initial word\n"
         "  --first-chunk N     first streamed chunk in latent frames (default 3)\n"
         "  --lead-chunk N      hold the chunk at N frames through the lead-in (0 = off)\n"
         "  --cfg X             classifier-free guidance scale (default 1.3,\n"
@@ -101,6 +105,8 @@ int cmd_tts(int argc, char** argv) {
     bool  postfilter = true;
     bool  trim_lead = true;
     int   first_chunk = 0, lead_chunk = 0;
+    int   merge_id_cap = 80000;
+    bool  canonical_first_word = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -119,6 +125,8 @@ int cmd_tts(int argc, char** argv) {
         else if (a == "--stream")                        { stream = true; }
         else if (a == "--no-postfilter")                 { postfilter = false; }
         else if (a == "--no-trim")                       { trim_lead = false; }
+        else if (a == "--merge-id-cap" && (i + 1 < argc)) { merge_id_cap = std::atoi(argv[++i]); }
+        else if (a == "--no-canonical-first-word")       { canonical_first_word = false; }
         else if (a == "--first-chunk" && (i + 1 < argc)) { first_chunk = std::atoi(argv[++i]); }
         else if (a == "--lead-chunk"  && (i + 1 < argc)) { lead_chunk  = std::atoi(argv[++i]); }
         else if (a == "-h" || a == "--help") {
@@ -215,6 +223,8 @@ int cmd_tts(int argc, char** argv) {
 
     p.postfilter = postfilter;
     p.trim_lead  = trim_lead;
+    p.tokenizer_max_merge_id         = merge_id_cap;
+    p.tokenizer_canonical_first_word = canonical_first_word;
     if (first_chunk > 0) p.stream_first_chunk_frames = first_chunk;
     if (lead_chunk  > 0) p.stream_lead_chunk_frames  = lead_chunk;
 

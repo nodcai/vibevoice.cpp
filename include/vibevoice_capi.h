@@ -122,6 +122,13 @@ typedef struct {
     float    neg_condition_anchor; /* < 0 -> 0.2; CFG negative-path anchor blend, 0..1 */
     int      no_postfilter;        /* non-zero: skip the DFN3 post-filter (output then 24 kHz) */
     int      no_trim;              /* non-zero: keep the lead-in silence */
+    /* Text encoding (appended; zero = default). Refuse BPE merges whose token
+       id is >= this: 0 -> 80000, < 0 -> off. Rare words that are a single
+       very-high-id token mispronounce. */
+    int      tokenizer_max_merge_id;
+    /* non-zero: encode a text-initial word as "C"+"ryptography" (the plain
+       encoding) instead of "Crypt"+"ography" */
+    int      no_canonical_first_word;
 } vv_capi_stream_params;
 
 // Fills `p` with the defaults above (all zero / -1 means "default").

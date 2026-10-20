@@ -329,6 +329,9 @@ vv_capi_stream* vv_capi_stream_begin(const char*                  voice_path,
     tp.neg_condition_anchor      = p->neg_condition_anchor >= 0.0f ? p->neg_condition_anchor : 0.2f;
     tp.postfilter                = p->no_postfilter == 0;
     tp.trim_lead                 = p->no_trim == 0;
+    tp.tokenizer_max_merge_id    = p->tokenizer_max_merge_id == 0 ? 80000
+                                 : p->tokenizer_max_merge_id > 0 ? p->tokenizer_max_merge_id : 0;
+    tp.tokenizer_canonical_first_word = p->no_canonical_first_word == 0;
     auto* s = new vv_capi_stream();
     s->cb = on_audio;
     s->user = user;

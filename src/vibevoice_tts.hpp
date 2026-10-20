@@ -195,7 +195,23 @@ struct VibeVoiceTTSParams {
     // utterance; the trimmed audio is not delivered at all, so time-to-first
     // -sound drops by the lead's length (typically ~150-800 ms).
     bool  trim_lead                 = true;
+    // Text encoding tweaks for the realtime model (Tokenizer::EncodeOptions;
+    // AGENTS.md "Gotchas" has the measurements). Refuse BPE merges whose
+    // token id is >= this (0 = off): rare words that are a single very-high
+    // -id token mispronounce. 80000 helps; 50000 breaks common words.
+    int   tokenizer_max_merge_id    = 80000;
+    // Encode a text-initial word as it would split mid-sentence
+    // ("Crypt"+"ography", not "C"+"ryptography").
+    bool  tokenizer_canonical_first_word = true;
 };
+
+// The tokenizer options the realtime path derives from `p`.
+inline Tokenizer::EncodeOptions tts_encode_options(const VibeVoiceTTSParams& p) {
+    Tokenizer::EncodeOptions o;
+    o.max_merge_token_id   = p.tokenizer_max_merge_id > 0 ? p.tokenizer_max_merge_id : 0;
+    o.canonical_first_word = p.tokenizer_canonical_first_word;
+    return o;
+}
 
 // Sample rate of the audio the realtime path delivers for these params:
 // 48000 with the post-filter active, else the model's 24000.

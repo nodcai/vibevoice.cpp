@@ -36,9 +36,26 @@ public:
     bool load(const ModelLoader& m);
     bool load_from_file(const std::string& path);
 
+    // Deviations from the canonical Qwen2 encoding, measured to help the
+    // realtime TTS model pronounce rare words (see AGENTS.md, "Gotchas").
+    // Both default to off: encode(text) is the canonical encoding.
+    struct EncodeOptions {
+        // During BPE, refuse a merge whose merged token id is >= this value
+        // (0 = off). Rare words that are a single very-high-id token come
+        // out as more frequent sub-word pieces instead.
+        int32_t max_merge_token_id = 0;
+        // For text starting with an ASCII letter, encode the first pre-token
+        // as if it followed a space and drop the space from the first
+        // resulting token when that spaceless twin exists in the vocab
+        // ("Crypt"+"ography" rather than "C"+"ryptography"). Otherwise the
+        // normal encoding is kept.
+        bool canonical_first_word = false;
+    };
+
     // Encode UTF-8 text to ids. Special tokens in the input string are
     // recognized and emitted as their reserved id (no BPE applied).
-    std::vector<int32_t> encode(const std::string& text) const;
+    std::vector<int32_t> encode(const std::string& text) const { return encode(text, EncodeOptions{}); }
+    std::vector<int32_t> encode(const std::string& text, const EncodeOptions& opts) const;
 
     // Decode ids back to UTF-8 text. Special tokens are emitted as their
     // text form.
@@ -56,7 +73,10 @@ public:
 
 private:
     void build_byte_maps();
-    int  bpe_pretoken_to_ids(const std::string& pre_tok, std::vector<int32_t>& out) const;
+    int  bpe_pretoken_to_ids(const std::string& pre_tok, int32_t max_merge_token_id,
+                             std::vector<int32_t>& out) const;
+    void bpe_first_word(const std::string& pre_tok, int32_t max_merge_token_id,
+                        std::vector<int32_t>& out) const;
 
     std::vector<std::string>                tokens_;       // id -> displayable string
     std::vector<int32_t>                    token_type_;

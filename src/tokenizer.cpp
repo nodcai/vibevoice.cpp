@@ -433,6 +433,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
 // ----- byte-level BPE -----
 
 int Tokenizer::bpe_pretoken_to_ids(const std::string& pre_tok,
+                                   int32_t               max_merge_token_id,
                                    std::vector<int32_t>& out) const {
     // Step 1: encode bytes through byte_to_unicode and build symbol list.
     std::vector<std::string> symbols;
@@ -445,7 +446,12 @@ int Tokenizer::bpe_pretoken_to_ids(const std::string& pre_tok,
         size_t   best_idx  = std::numeric_limits<size_t>::max();
         for (size_t k = 0; k + 1 < symbols.size(); ++k) {
             auto it = merge_rank_.find({symbols[k], symbols[k + 1]});
-            if (it != merge_rank_.end() && it->second < best_rank) {
+            if (it == merge_rank_.end()) continue;
+            if (max_merge_token_id > 0) {
+                auto tid = token_id_.find(symbols[k] + symbols[k + 1]);
+                if (tid != token_id_.end() && tid->second >= max_merge_token_id) continue;
+            }
+            if (it->second < best_rank) {
                 best_rank = it->second;
                 best_idx  = k;
             }
@@ -465,8 +471,36 @@ int Tokenizer::bpe_pretoken_to_ids(const std::string& pre_tok,
     return unknown;
 }
 
-std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
+// A text-initial word has no leading space, so byte-level BPE splits it
+// differently from the same word mid-sentence ("C"+"ryptography" vs
+// " Crypt"+"ography"). Encode it as if it followed a space and drop the
+// space from the first piece when that spaceless token exists.
+void Tokenizer::bpe_first_word(const std::string&    pre_tok,
+                               int32_t               max_merge_token_id,
+                               std::vector<int32_t>& out) const {
+    std::vector<int32_t> spaced;
+    bpe_pretoken_to_ids(" " + pre_tok, max_merge_token_id, spaced);
+    if (!spaced.empty()) {
+        const std::string& sp = byte_to_chstr_[static_cast<unsigned char>(' ')];
+        const std::string& t0 = tokens_[spaced[0]];
+        if (t0.size() > sp.size() && t0.compare(0, sp.size(), sp) == 0) {
+            auto twin = token_id_.find(t0.substr(sp.size()));
+            if (twin != token_id_.end()) {
+                spaced[0] = twin->second;
+                out.insert(out.end(), spaced.begin(), spaced.end());
+                return;
+            }
+        }
+    }
+    bpe_pretoken_to_ids(pre_tok, max_merge_token_id, out);
+}
+
+std::vector<int32_t> Tokenizer::encode(const std::string& text, const EncodeOptions& opts) const {
     std::vector<int32_t> out;
+    // The first pre-token is the text-initial word exactly when the text
+    // starts with a letter (no special token or punctuation precedes it).
+    bool canon_first = opts.canonical_first_word && !text.empty() &&
+                       is_ascii_letter(static_cast<unsigned char>(text[0]));
 
     // First pass: split `text` into a list of fragments — either a literal
     // special-token (emitted as a single id) or a plain-text run that the
@@ -491,7 +525,12 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text) const {
                 }
             }
             if (is_special) continue;
-            bpe_pretoken_to_ids(pt, out);
+            if (canon_first) {
+                canon_first = false;
+                bpe_first_word(pt, opts.max_merge_token_id, out);
+            } else {
+                bpe_pretoken_to_ids(pt, opts.max_merge_token_id, out);
+            }
         }
     };
 

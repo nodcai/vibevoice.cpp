@@ -569,7 +569,7 @@ int vibevoice_tts_generate_streaming(VibeVoiceModel*           model,
     std::string t = text;
     while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n')) t.pop_back();
     t += "\n";
-    const std::vector<int32_t> ids = model->tokenizer.encode(t);
+    const std::vector<int32_t> ids = model->tokenizer.encode(t, tts_encode_options(p));
     if (ids.empty()) {
         VV_LOG_ERROR("tokenizer produced no tokens");
         return -3;

@@ -87,7 +87,7 @@ CMake options:
 | ------------------------------- | ------------------------------------------------------- | :-----------: |
 | `test_smoke`                    | Lib loads, version string is non-empty                  | no            |
 | `test_audio_io`                 | dr_wav round-trip                                       | no            |
-| `test_tokenizer`                | Qwen2 BPE id-level parity vs HF on a fixture            | no            |
+| `test_tokenizer`                | Qwen2 BPE parity vs HF + realtime encode options        | tokenizer¹    |
 | `test_rope`                     | RoPE cos/sin tables vs PyTorch                          | no            |
 | `test_qwen2_block`              | Qwen2 forward pass numerics                             | no            |
 | `test_sconv1d`                  | Causal conv1d / convtranspose1d numerics                | no            |
@@ -100,6 +100,10 @@ CMake options:
 | `test_e2e_asr`                  | Real ASR encoder runs + tone smoke                      | yes (env)     |
 | `test_closed_loop`              | TTS → ASR roundtrip; ≥80 % source-word recall           | **yes**       |
 | `test_long_form_asr`            | 65 s audio (TTS×N) round-trips with multi-segment match | **yes**       |
+
+¹ `tests/fixtures/tokenizer.gguf`, else `VIBEVOICE_TOKENIZER`, else a
+model gguf that embeds the tokenizer via `VIBEVOICE_TTS_MODEL` /
+`VIBEVOICE_MODEL`; skips 77 without one.
 
 Env vars for the model-dependent tests (set whichever ones you need):
 
@@ -230,6 +234,27 @@ These bit us before. They will probably bite again.
 13. **The post-filter changes the output rate to 48 kHz.** Anything that
     writes or plays audio must ask `vibevoice_tts_output_sample_rate` /
     `vv_capi_stream_sample_rate`.
+
+14. **The realtime model mispronounces rare words for two tokenization
+    reasons, so the realtime path does not use the canonical Qwen2
+    encoding.** (a) A rare word that is a single very-high-id token
+    (" cryptography" = 86837, " orthogonal" = 94580) comes out garbled;
+    `VibeVoiceTTSParams::tokenizer_max_merge_id` (default 80000) refuses
+    BPE merges whose token id is at or above the cap, so it becomes
+    " crypt" + "ography". 80000 was chosen because it lifted the rare-word
+    hit rate (73.7 % -> 77.1 %) with no collateral damage, while 50000
+    broke common words (hyperbole, Kubernetes, quinoa). (b) A
+    text-initial capitalised word splits as "C" + "ryptography" (no
+    leading space), which the model reads as spelling;
+    `tokenizer_canonical_first_word` (default on) encodes it as it would
+    mid-sentence and swaps the first piece for its spaceless twin
+    ("Crypt" + "ography"), taking sentence-initial rare words from 1/10
+    to 10/10. A literal leading space instead destabilises other sentence
+    starts. Both live in `Tokenizer::EncodeOptions`; the plain
+    `encode(text)` stays canonical (test_tokenizer pins both behaviours),
+    and the 1.5B and ASR prompts use it. Benchmark: 24 sentences, 35
+    rare-word slots, 10 seeds, Nemotron ASR judge; combined with Q8 LM
+    weights the two tweaks reach 83 % vs 73.7 %.
 
 ## Adding a new test
 
