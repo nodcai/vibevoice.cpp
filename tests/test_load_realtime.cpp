@@ -20,7 +20,9 @@ struct Expect {
 };
 
 void expect_lm(std::vector<Expect>* out, const std::string& prefix, int n_layers) {
-    out->push_back({prefix + ".tok_embd.weight", true});
+    // The TTS-LM only ever receives input embeddings, so quantized files drop
+    // tlm.tok_embd.weight (vibevoice-quantize default); only lm's is required.
+    out->push_back({prefix + ".tok_embd.weight", prefix == "lm"});
     for (int i = 0; i < n_layers; ++i) {
         char b[64]; std::snprintf(b, sizeof(b), "%s.blk.%d.", prefix.c_str(), i);
         std::string p(b);
