@@ -16,6 +16,7 @@ artifacts into the GGUF format the C++ runtime consumes.
                                               (optional)          │
                                                                  ▼
                                                         quantize_gguf.py ─► …-q8_0.gguf
+                                                        vibevoice-quantize ─► …-mixed.gguf (K-quants)
 ```
 
 ## `scripts/convert_tokenizer.py`
@@ -124,13 +125,15 @@ python scripts/convert_voice_to_gguf.py \
 Voice GGUFs are model-agnostic in shape but specific to the realtime
 TTS architecture (`realtime-0.5b`); they are not used by ASR.
 
-## `scripts/quantize_gguf.py`
+## `scripts/quantize_gguf.py` and `vibevoice-quantize`
 
-Optional. Takes any vibevoice GGUF and produces a quantized variant by
+Optional. Both take any vibevoice GGUF and produce a quantized variant by
 selectively quantizing only the LM matmul weights — attention q/k/v/o,
 FFN gate/up/down, and `lm_head` — to a target dtype.  Everything else
-(conv1d kernels, RMSNorm scales, biases, layer-scale gammas, embeddings,
-small scalars) passes through unchanged.
+(conv1d kernels, RMSNorm scales, biases, layer-scale gammas, small
+scalars) passes through unchanged. The token embedding is kept at its
+source dtype unless `--embed-type q8_0` is given (realtime-0.5b only: the
+1.5B and ASR runtimes read the table as F32/F16).
 
 Why selective: `ggml_mul_mat` handles quantized weights natively, but
 the conv1d wrapper in `src/conv1d.cpp` casts kernels to fp16 inline
@@ -144,18 +147,95 @@ python scripts/quantize_gguf.py \
     --type q8_0
 ```
 
-Available dtypes (limited by what `gguf-py` can encode in pure Python):
+The Python script encodes what `gguf-py` can in pure Python: `q8_0`,
+`q5_0`, `q4_0`, `f16`. For K-quants use `build/bin/vibevoice-quantize`
+(built with the examples; links libggml), which takes the same tensor
+selection plus per-family overrides (`--attn-type`, `--ffn-type`,
+`--lm-head-type`, `--decoder-ffn-type`, `--head-type`, `--embed-type`).
+Asking the Python script for a K-quant fails before anything is written
+and says so.
 
-| `--type` | Bits/elem (matmul) | Notes                                              |
-| -------- | ------------------ | -------------------------------------------------- |
-| `q8_0`   | 8.5                | ~50–60 % size reduction; near-lossless             |
-| `q5_k`*  | 5.5                | Not implemented in gguf-py (needs libggml.so)      |
-| `q6_k`*  | 6.5                | Not implemented in gguf-py (needs libggml.so)      |
-| `q4_k`*  | 4.5                | Not implemented in gguf-py (needs libggml.so)      |
-| `f16`    | 16                 | No quantization — just dtype cast                  |
+### K-quants need a row width that is a multiple of 256
 
-`*` selectable in the script signature; will raise `NotImplementedError`
-until we add a libggml-backed backend.
+`Q4_K` / `Q5_K` / `Q6_K` pack 256 elements per super-block, so a tensor
+only takes a K-quant when `ne[0]` (its input width) is divisible by 256.
+The realtime model's LM is a Qwen2.5-0.5B with hidden size 896 = 3.5 x
+256, so:
+
+| tensor family (realtime-0.5b)       | `ne[0]` | K-quantizable? |
+| ----------------------------------- | ------: | :------------: |
+| `{lm,tlm}.blk.*.attn_{q,k,v,o}.weight` | 896   | no (96 tensors)  |
+| `{lm,tlm}.blk.*.ffn_{gate,up}.weight`  | 896   | no (48 tensors)  |
+| `{lm,tlm}.blk.*.ffn_down.weight`       | 4864  | **yes** (24 tensors) |
+| `lm.tok_embd.weight`                | 896     | no             |
+| `at.dec.*.ffn_linear{1,2}`          | 32–8192 | mostly; the 12 narrowest fall back |
+
+Tensors that cannot take the requested K-quant get the block-32 type from
+`--fallback` (Python) / `--fallback-type` (C++), **default `q8_0`**; the
+older default followed llama.cpp's ladder (q4_k → q5_0) and the published
+realtime q4_k file was built with an explicit `--fallback-type q4_0
+--embed-type q4_0`. That file's LM is therefore 157 tensors of Q4_0 plus
+24 of Q4_K, and Q4_0 LM weights cost about 6 points of rare-word
+pronunciation accuracy (73.7 % vs 79.7 % rare-word slots hit with Q8_0;
+F16 gives 78.3 %, so Q8_0 loses nothing). Everyday-word WER does not show
+it. Both tools print a per-family table at the end so a fallback is
+visible:
+
+```
+tensor group       type   tensors       MB  note
+lm attn q/k/v/o    q8_0        96     46.8  fallback from q4_K
+lm ffn_gate/up     q8_0        48    222.3  fallback from q4_K
+lm ffn_down        q4_K        24     58.8
+lm.tok_embd        q8_0         1    144.7
+decoder ffn        q6_K        40    247.5
+decoder ffn        q8_0        12      0.4  fallback from q6_K
+diffusion head     q8_0        22     44.7
+```
+
+### Recommended recipe for the realtime TTS model
+
+LM attention / gate / up and the token embedding at q8_0, `ffn_down` at
+q4_k, decoder FFN at q6_k, diffusion head at q8_0:
+
+```bash
+./build/bin/vibevoice-quantize --src models/vibevoice-realtime-0.5B.gguf \
+    --out models/vibevoice-realtime-0.5b-mixed.gguf \
+    --type q4_k --fallback-type q8_0 --decoder-ffn-type q6_k \
+    --embed-type q8_0 --head-type q8_0
+```
+
+Size by family, computed from the tensor shapes of the published file
+(the same model reproduces the published q4_k file's 661 MB of tensor data
+exactly; add ~6 MB for header, tokenizer and the DeepFilterNet3 weights):
+
+| family                          | type  | MB    |
+| ------------------------------- | ----- | ----: |
+| LM attention q/k/v/o            | q8_0  | 47    |
+| LM `ffn_gate` / `ffn_up`        | q8_0  | 222   |
+| LM `ffn_down`                   | q4_k  | 59    |
+| token embedding                 | q8_0  | 145   |
+| decoder FFN                     | q6_k  | 248   |
+| diffusion head                  | q8_0  | 45    |
+| everything else (convs, norms)  | f16   | 91    |
+| **total**                       |       | **~856 MB tensors, ~862 MB file** |
+
+Against 667 MB for the published q4_k file and 1.1 GB for q8_0
+throughout. Swapping the LM fallback for `q5_0` would give ~767 MB, but
+Q5_0 has not been measured on the rare-word benchmark. The mixed file has
+not been rebuilt yet: it needs an F16 conversion of the HF checkpoint via
+`convert_vibevoice_to_gguf.py` as the source.
+
+Available dtypes:
+
+| `--type` | Bits/elem (matmul) | Python script | `vibevoice-quantize` |
+| -------- | ------------------ | :-----------: | :------------------: |
+| `q8_0`   | 8.5                | yes           | yes                  |
+| `q5_0`   | 5.5                | yes           | yes                  |
+| `q4_0`   | 4.5                | yes           | yes                  |
+| `q6_k`   | 6.5 (rows % 256)   | no            | yes                  |
+| `q5_k`   | 5.5 (rows % 256)   | no            | yes                  |
+| `q4_k`   | 4.5 (rows % 256)   | no            | yes                  |
+| `f16`    | 16                 | yes           | yes                  |
 
 ## Closed-loop verification
 

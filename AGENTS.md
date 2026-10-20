@@ -256,6 +256,18 @@ These bit us before. They will probably bite again.
     rare-word slots, 10 seeds, Nemotron ASR judge; combined with Q8 LM
     weights the two tweaks reach 83 % vs 73.7 %.
 
+15. **K-quants need row width % 256 == 0.** Q4_K/Q5_K/Q6_K super-blocks
+    are 256 wide and the realtime LM's hidden size is 896, so every
+    attention q/k/v/o, ffn_gate, ffn_up and the token embedding cannot
+    take a K-quant; only ffn_down (4864) can. `vibevoice-quantize` and
+    `quantize_gguf.py` fall back to a block-32 type for those rows
+    (default now q8_0, printed in a per-family table). The published
+    realtime q4_k file was built with `--fallback-type q4_0 --embed-type
+    q4_0`, and Q4_0 LM weights cost ~6 points of rare-word pronunciation
+    (73.7 % vs 79.7 % slots hit at Q8_0; F16 is 78.3 %, so Q8_0 is free).
+    Everyday-word WER does not show it, so the closed-loop test alone
+    cannot sign off a quantization recipe.
+
 ## Adding a new test
 
 ```bash
@@ -291,7 +303,10 @@ mappings go in `KEY_REWRITES` near the top of
 
 1. Convert from upstream HF safetensors with
    `scripts/convert_vibevoice_to_gguf.py`.
-2. Quantize with `scripts/quantize_gguf.py --type q8_0`.
+2. Quantize with `scripts/quantize_gguf.py --type q8_0`, or for the
+   realtime TTS model the mixed recipe in `docs/conversion.md`
+   (`vibevoice-quantize --type q4_k --fallback-type q8_0 ...`). Check the
+   per-family table it prints: nothing in the LM should say q4_0.
 3. Run the closed-loop test against the quantized output to confirm
    no quality regression.
 4. `hf upload-large-folder mudler/vibevoice.cpp-models <staging-dir>` —

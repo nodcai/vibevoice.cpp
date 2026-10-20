@@ -117,8 +117,12 @@ hf download nodcai/VibeVoice-Realtime-0.5B-DFN --local-dir models
 
 | file | size | notes |
 |---|---:|---|
-| `vibevoice-realtime-0.5b-dfn-q4_k.gguf` | 667 MB | q4_k LM, q6_k decoder FFN, q4_0 embedding; same word error rate as q8_0 |
-| `vibevoice-realtime-0.5b-dfn-q8_0.gguf` | 1.1 GB | q8_0 throughout; decoder waveform within 1% of F16 |
+| `vibevoice-realtime-0.5b-dfn-q8_0.gguf` | 1.1 GB | q8_0 throughout; decoder waveform within 1% of F16. Recommended. |
+| `vibevoice-realtime-0.5b-dfn-q4_k.gguf` | 667 MB | **q4_0** LM attention / gate / up and embedding (896-wide rows cannot take q4_k, see below), q4_k ffn_down, q6_k decoder FFN. Same whisper WER as q8_0 on everyday words, but about 6 points worse on rare words. |
+
+The q4_k file is a smaller download, not a free one: see "Quantizing the
+realtime model" below for what it actually contains and for the mixed
+recipe (~0.86 GB) that keeps rare-word pronunciation.
 
 No `--tokenizer` is needed; the output is 48 kHz. The sections below explain
 what is inside and how to build such a file yourself.
@@ -165,33 +169,66 @@ python scripts/merge_dfn_gguf.py \
 
 The tokenizer can ride in the same file (`--tokenizer` on the merge script or
 the converter), after which `--tokenizer` on the CLI and `tokenizer_path` on
-the C ABI are optional. For a smaller file, quantize a full-precision
-conversion before merging. The LM layers are only 380 MB of the 1.9 GB
-F16 model; the acoustic decoder's FFN matrices (604 MB), the token
-embedding (272 MB) and an unused 272 MB TTS-LM embedding table are where
-the bytes go:
+the C ABI are optional.
+
+### Quantizing the realtime model
+
+For a smaller file, quantize a full-precision conversion before merging.
+The LM layers are only 380 MB of the 1.9 GB F16 model; the acoustic
+decoder's FFN matrices (604 MB), the token embedding (272 MB) and an
+unused 272 MB TTS-LM embedding table are where the bytes go.
+
+**K-quants need a row width that is a multiple of 256.** Q4_K / Q5_K /
+Q6_K pack 256 weights per super-block, and the realtime LM is a
+Qwen2.5-0.5B with hidden size 896 = 3.5 x 256. So `--type q4_k` can only
+apply to `ffn_down` (4864 wide, 24 tensors); every attention q/k/v/o
+projection, `ffn_gate`, `ffn_up` (144 tensors) and the token embedding
+take the block-32 `--fallback-type` instead. The published q4_k file was
+built with `--fallback-type q4_0 --embed-type q4_0`, so despite its name
+its LM is essentially Q4_0 with a Q4_K `ffn_down`. The tool now defaults
+the fallback to q8_0 and prints a per-family table of what ended up in
+which type.
+
+Recommended recipe: LM attention / gate / up and the token embedding at
+q8_0, `ffn_down` at q4_k, decoder FFN at q6_k, diffusion head at q8_0:
 
 ```bash
 ./build/bin/vibevoice-quantize --src models/vibevoice-realtime-0.5B.gguf \
-  --out models/vibevoice-realtime-0.5b-q4_k.gguf \
-  --type q4_k --fallback-type q4_0 --decoder-ffn-type q6_k --embed-type q4_0 --head-type q8_0
-python scripts/merge_dfn_gguf.py --model models/vibevoice-realtime-0.5b-q4_k.gguf \
+  --out models/vibevoice-realtime-0.5b-mixed.gguf \
+  --type q4_k --fallback-type q8_0 --decoder-ffn-type q6_k --embed-type q8_0 --head-type q8_0
+python scripts/merge_dfn_gguf.py --model models/vibevoice-realtime-0.5b-mixed.gguf \
   --dfn models/deepfilternet3.gguf --tokenizer models/tokenizer.gguf \
-  --out models/vibevoice-realtime-0.5b-dfn-q4_k.gguf
+  --out models/vibevoice-realtime-0.5b-dfn-mixed.gguf
 ```
 
-Measured on 12 sentences x 6 seeds (Emma voice, 3 steps, CFG 1.7), word
-error rate by whisper small.en, no runaway generations in 216 runs:
+Rare-word pronunciation, 24 sentences with 35 rare-word slots x 10 seeds,
+judged by Nemotron ASR (a slot counts when the rare word is transcribed):
 
-| recipe | size | WER | decoder waveform vs F16 |
-|---|---:|---:|---:|
-| q8_0 everywhere, embedding dropped | 1.1 GB | 4.1 % | 0.6-1.1 % |
-| the recipe above | 0.66 GB | 3.8 % | ~2 % |
-| same with decoder FFN q4_k | 0.62 GB | 4.5 % | 8-12 % |
+| LM attention / gate / up weights | rare-word slots hit |
+|---|---:|
+| q4_0 (the published q4_k file) | 73.7 % |
+| q8_0 | 79.7 % |
+| f16 | 78.3 % |
 
-The WER is whisper writing "7.15" for "seven fifteen"; the same tokens
-miss for every variant. No recipe changes speed: the per-frame graph is
-launch-bound.
+Q8_0 is as good as F16 here; Q4_0 is not. Everyday-word WER (12 sentences
+x 6 seeds, Emma voice, 3 steps, CFG 1.7, whisper small.en, no runaway
+generations in 216 runs) does not show the difference, which is how the
+q4_k file was signed off:
+
+| recipe | size | whisper WER | rare-word slots hit | decoder waveform vs F16 |
+|---|---:|---:|---:|---:|
+| q8_0 everywhere, embedding dropped | 1.1 GB | 4.1 % | 79.7 % | 0.6-1.1 % |
+| mixed recipe above | ~0.86 GB (computed from tensor shapes; not yet rebuilt) | not measured | expected ≈ q8_0 | ~2 % |
+| published q4_k (fallback q4_0, embedding q4_0) | 0.66 GB | 3.8 % | 73.7 % | ~2 % |
+| same with decoder FFN q4_k | 0.62 GB | 4.5 % | | 8-12 % |
+
+The whisper WER is whisper writing "7.15" for "seven fifteen"; the same
+tokens miss for every variant. No recipe changes speed: the per-frame
+graph is launch-bound. The rare-word column carries the per-LM-weight-type
+figures from the table above; the mixed file's entry is an expectation
+from the q8_0 LM measurement, not a measurement of that file, and its
+size was computed from the tensor shapes of the published q4_k file (the
+same size model reproduces that file's 661 MB of tensor data exactly).
 
 With the filter present the output is 48 kHz (its native rate); ask
 `vibevoice_tts_output_sample_rate` / `vv_capi_stream_sample_rate` rather

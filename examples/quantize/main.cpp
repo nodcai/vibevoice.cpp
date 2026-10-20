@@ -14,8 +14,15 @@
 // Q4_0 / Q5_0 / Q8_0 / BF16 in pure python. K-quants (Q4_K, Q5_K, Q6_K)
 // need libggml linkage — that's what this tool provides.
 //
+// K-quants pack 256 elements per super-block, so a tensor only takes a
+// K-quant when its row width (ne[0]) is a multiple of 256. The realtime
+// model's hidden size is 896, so every attention projection, ffn_gate,
+// ffn_up and the token embedding cannot; only ffn_down (4864) can. Such
+// rows take --fallback-type (default q8_0). The summary printed at the
+// end shows what ended up in which type, per tensor family.
+//
 // Usage:
-//   vibevoice-quantize --src in.gguf --out out.gguf --type q4_k_m
+//   vibevoice-quantize --src in.gguf --out out.gguf --type q4_k
 
 #include "ggml.h"
 #include "gguf.h"
@@ -23,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <regex>
 #include <string>
 #include <vector>
@@ -123,7 +131,7 @@ int main(int argc, char** argv) {
         else if (a == "--decoder-ffn-type" && i + 1 < argc) dec_ffn_type_str = argv[++i];
         else if (a == "--head-type"        && i + 1 < argc) head_type_str    = argv[++i];
         else if (a == "--embed-type"       && i + 1 < argc) embed_type_str   = argv[++i];
-        else if (a == "--fallback-type"    && i + 1 < argc) fallback_type_str = argv[++i];
+        else if ((a == "--fallback-type" || a == "--fallback") && i + 1 < argc) fallback_type_str = argv[++i];
         else if (a == "-h" || a == "--help") {
             std::fprintf(stderr,
                 "usage: %s --src in.gguf --out out.gguf --type <type>\n"
@@ -143,10 +151,14 @@ int main(int argc, char** argv) {
                 "                         of the realtime model at F16, q8_0 halves that.\n"
                 "  --head-type <type>     quantize the diffusion head's matrices (dh.*); default: keep\n"
                 "  --embed-type <type>    quantize lm.tok_embd.weight (272 MB at F16) to a\n"
-                "                         block-32 type (q8_0 / q5_0 / q4_0); the runtime\n"
-                "                         dequantizes rows on lookup\n"
-                "  --fallback-type <type> type for rows a k-quant cannot cover (default:\n"
-                "                         q5_0 for q4_k, q5_1 for q5_k, q8_0 for q6_k, q4_0 below)\n"
+                "                         block-32 type; the realtime-0.5b runtime dequantizes\n"
+                "                         rows on lookup (1.5B / ASR read F16 only). Keep it at\n"
+                "                         q8_0 or better: rare-token rows are what a coarse\n"
+                "                         embedding damages first.\n"
+                "  --fallback-type <type> (or --fallback) type for rows a K-quant cannot cover:\n"
+                "                         K-quants need ne0 %% 256 == 0, and at hidden 896 that\n"
+                "                         excludes every LM matrix except ffn_down. Default q8_0;\n"
+                "                         q4_0 here costs ~6 points of rare-word pronunciation.\n"
                 "  --keep-tlm-embed  keep tlm.tok_embd.weight. The TTS-LM only ever receives\n"
                 "                         input embeddings, so its 272 MB table is unused and\n"
                 "                         dropped by default.\n",
@@ -184,6 +196,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--embed-type must be a block-32 type (q8_0 / q5_0 / q5_1 / q4_0 / q4_1)\n");
         return 1;
     }
+    if (quant_embed && embed_target != GGML_TYPE_Q8_0) {
+        std::fprintf(stderr,
+            "warning: --embed-type %s stores the token embedding below q8_0; rare-token\n"
+            "         rows lose pronunciation accuracy first. q8_0 is the recommended floor.\n",
+            ggml_type_name(embed_target));
+    }
     const ggml_type dec_ffn_target = quant_dec_ffn ? resolve_override(dec_ffn_type_str, "--decoder-ffn-type") : target;
     const ggml_type head_target    = quant_head    ? resolve_override(head_type_str,    "--head-type")        : target;
 
@@ -205,6 +223,19 @@ int main(int argc, char** argv) {
 
     const int64_t n = gguf_get_n_tensors(src_gguf);
     std::printf("loaded %s: %lld tensors\n", src.c_str(), static_cast<long long>(n));
+
+    {
+        // Only the realtime TTS loop dequantizes embedding rows on lookup;
+        // the 1.5B and ASR paths read lm.tok_embd as F32/F16.
+        const int64_t vk = gguf_find_key(src_gguf, "vibevoice.variant");
+        const std::string variant = vk >= 0 ? gguf_get_val_str(src_gguf, vk) : "realtime-0.5b";
+        if (quant_embed && variant != "realtime-0.5b") {
+            std::fprintf(stderr, "--embed-type is only supported for variant realtime-0.5b (this file: %s)\n",
+                         variant.c_str());
+            gguf_free(src_gguf); ggml_free(src_ctx);
+            return 1;
+        }
+    }
 
     // Build a fresh gguf and a sibling ggml_context that holds tensors with
     // the new (possibly quantized) types pointing at our own buffers. Doing
@@ -230,7 +261,30 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::vector<uint8_t>> kept;  // owns our quantized / passthrough buffers
-    size_t bytes_in = 0, bytes_out = 0, n_quant = 0;
+    size_t bytes_in = 0, bytes_out = 0, n_quant = 0, n_fallback = 0;
+
+    // Per-family summary so a fallback is visible in the output, not only
+    // in a scrolled-away stderr line: family -> type -> (count, bytes, note).
+    const char* const families[] = {
+        "lm attn q/k/v/o", "lm ffn_gate/up", "lm ffn_down", "lm_head", "lm.tok_embd",
+        "decoder ffn", "diffusion head", "other"};
+    struct Cell { size_t count = 0; size_t bytes = 0; std::string note; };
+    std::map<std::string, std::map<std::string, Cell>> summary;
+    auto family_of = [](const std::string& s) -> const char* {
+        static const auto attn    = std::regex(R"(^(lm|tlm)\.blk\.\d+\.attn_[qkvo]\.weight$)");
+        static const auto gate_up = std::regex(R"(^(lm|tlm)\.blk\.\d+\.ffn_(gate|up)\.weight$)");
+        static const auto down    = std::regex(R"(^(lm|tlm)\.blk\.\d+\.ffn_down\.weight$)");
+        static const auto dec_ffn = std::regex(R"(^at\.dec\.stage_\d+_block_\d+\.weight\.ffn_linear[12]$)");
+        static const auto dh_mat  = std::regex(R"(^dh\.(noisy_proj|cond_proj|t_embed_lin[12]|final\.(proj|adaln)|layer_\d+\.(ffn_gate|ffn_up|ffn_down|adaln))$)");
+        if (std::regex_match(s, attn))    return "lm attn q/k/v/o";
+        if (std::regex_match(s, gate_up)) return "lm ffn_gate/up";
+        if (std::regex_match(s, down))    return "lm ffn_down";
+        if (s == "lm_head.weight")        return "lm_head";
+        if (s == "lm.tok_embd.weight")    return "lm.tok_embd";
+        if (std::regex_match(s, dec_ffn)) return "decoder ffn";
+        if (std::regex_match(s, dh_mat))  return "diffusion head";
+        return "other";
+    };
 
     for (int64_t i = 0; i < n; ++i) {
         const char* name = gguf_get_tensor_name(src_gguf, i);
@@ -266,24 +320,21 @@ int main(int argc, char** argv) {
         }
         const bool wantq   = extra_quant || should_quantize(name, include_embed);
         // K-quants need rows divisible by 256; this model's hidden size is
-        // 896, so most matmul weights are not. Fall back per tensor the way
-        // llama.cpp does (q2_k/q3_k -> q4_0, q4_k -> q5_0, q5_k -> q5_1,
-        // q6_k -> q8_0) instead of leaving the tensor at full precision.
+        // 896, so every LM matrix except ffn_down is not. Fall back per
+        // tensor to a block-32 type instead of leaving it at full precision.
+        // The default is q8_0, not llama.cpp's q5_0/q4_0 ladder: on the
+        // realtime model Q4_0 LM rows cost ~6 points of rare-word
+        // pronunciation while Q8_0 matches F16.
+        std::string fb_note;
         if (wantq && st->ne[0] % ggml_blck_size(tensor_target) != 0) {
-            ggml_type fb = tensor_target;
-            if (have_fallback) fb = fallback_type; else
-            switch (tensor_target) {
-                case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: fb = GGML_TYPE_Q4_0; break;
-                case GGML_TYPE_Q4_K:                      fb = GGML_TYPE_Q5_0; break;
-                case GGML_TYPE_Q5_K:                      fb = GGML_TYPE_Q5_1; break;
-                case GGML_TYPE_Q6_K:                      fb = GGML_TYPE_Q8_0; break;
-                default: break;
-            }
+            const ggml_type fb = have_fallback ? fallback_type : GGML_TYPE_Q8_0;
             if (fb != tensor_target && st->ne[0] % ggml_blck_size(fb) == 0) {
                 std::fprintf(stderr, "fallback %s [ne0=%lld] %s -> %s (row not divisible by %d)\n",
                              name, static_cast<long long>(st->ne[0]), ggml_type_name(tensor_target),
-                             ggml_type_name(fb), ggml_blck_size(tensor_target));
+                             ggml_type_name(fb), static_cast<int>(ggml_blck_size(tensor_target)));
+                fb_note = std::string("fallback from ") + ggml_type_name(tensor_target);
                 tensor_target = fb;
+                ++n_fallback;
             }
         }
         const int blk      = ggml_blck_size(tensor_target);
@@ -328,6 +379,12 @@ int main(int argc, char** argv) {
             std::memcpy(kept.back().data(), st->data, in_size);
         }
         bytes_out += out_size;
+        {
+            Cell& c = summary[family_of(sname)][ggml_type_name(out_type)];
+            c.count += 1; c.bytes += out_size;
+            if (!fb_note.empty()) c.note = fb_note;
+            else if (wantq && !can_quant) c.note = "kept: row not divisible";
+        }
 
         gguf_add_tensor(dst_gguf, dt);
     }
@@ -336,9 +393,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "failed to write %s\n", out.c_str()); return 5;
     }
 
+    std::printf("%-18s %-6s %7s %8s  note\n", "tensor group", "type", "tensors", "MB");
+    for (const char* fam : families) {
+        const auto it = summary.find(fam);
+        if (it == summary.end()) continue;
+        for (const auto& [ty, c] : it->second) {
+            std::printf("%-18s %-6s %7zu %8.1f  %s\n", fam, ty.c_str(), c.count,
+                        static_cast<double>(c.bytes) / 1e6, c.note.c_str());
+        }
+    }
     const double saved_gb = (static_cast<double>(bytes_in) - bytes_out) / (1024.0*1024.0*1024.0);
-    std::printf("wrote %s: quantized %zu tensors → %s, saved %.2f GB (%.1f%%)\n",
-                out.c_str(), n_quant, type_str.c_str(), saved_gb,
+    std::printf("wrote %s: quantized %zu tensors (%zu via fallback %s), %.0f MB -> %.0f MB, "
+                "saved %.2f GB (%.1f%%)\n",
+                out.c_str(), n_quant, n_fallback,
+                ggml_type_name(have_fallback ? fallback_type : GGML_TYPE_Q8_0),
+                bytes_in / 1e6, bytes_out / 1e6, saved_gb,
                 100.0 * (1.0 - static_cast<double>(bytes_out) / bytes_in));
 
     ggml_quantize_free();
