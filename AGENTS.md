@@ -304,9 +304,11 @@ mappings go in `KEY_REWRITES` near the top of
 1. Convert from upstream HF safetensors with
    `scripts/convert_vibevoice_to_gguf.py`.
 2. Quantize with `scripts/quantize_gguf.py --type q8_0`, or for the
-   realtime TTS model the mixed recipe in `docs/conversion.md`
-   (`vibevoice-quantize --type q4_k --fallback-type q8_0 ...`). Check the
-   per-family table it prints: nothing in the LM should say q4_0.
+   realtime TTS model the attn-q8 recipe in `docs/conversion.md`
+   (`vibevoice-quantize --type q4_k --fallback-type q4_0 --attn-type q8_0
+   --embed-type q8_0 ...`). Check the per-family table it prints: attention
+   and the embedding must say q8_0; gate/up at q4_0 is deliberate (phone
+   GPU bandwidth, see the README).
 3. Run the closed-loop test against the quantized output to confirm
    no quality regression.
 4. `hf upload-large-folder mudler/vibevoice.cpp-models <staging-dir>` —

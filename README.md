@@ -117,12 +117,13 @@ hf download nodcai/VibeVoice-Realtime-0.5B-DFN --local-dir models
 
 | file | size | notes |
 |---|---:|---|
-| `vibevoice-realtime-0.5b-dfn-q8_0.gguf` | 1.1 GB | q8_0 throughout; decoder waveform within 1% of F16. Recommended. |
-| `vibevoice-realtime-0.5b-dfn-q4_k.gguf` | 667 MB | **q4_0** LM attention / gate / up and embedding (896-wide rows cannot take q4_k, see below), q4_k ffn_down, q6_k decoder FFN. Same whisper WER as q8_0 on everyday words, but about 6 points worse on rare words. |
+| `vibevoice-realtime-0.5b-dfn-attn-q8.gguf` | 757 MB | q8_0 attention, token embedding and diffusion head; q4_0 gate / up, q4_k ffn_down, q6_k decoder FFN. Same speed as q4_k on an iPhone, best rare-word pronunciation. Recommended. |
+| `vibevoice-realtime-0.5b-dfn-q8_0.gguf` | 1.1 GB | q8_0 throughout; decoder waveform within 1% of F16. 21 % slower per frame on a phone GPU for no measurable gain over attn-q8. |
+| `vibevoice-realtime-0.5b-dfn-q4_k.gguf` | 667 MB | **q4_0** LM attention / gate / up and embedding (896-wide rows cannot take q4_k, see below), q4_k ffn_down, q6_k decoder FFN. Same whisper WER as q8_0 on everyday words, but worse on rare words. |
 
 The q4_k file is a smaller download, not a free one: see "Quantizing the
-realtime model" below for what it actually contains and for the mixed
-recipe (~0.86 GB) that keeps rare-word pronunciation.
+realtime model" below for what it actually contains and for the attn-q8
+recipe that keeps rare-word pronunciation at the same speed.
 
 No `--tokenizer` is needed; the output is 48 kHz. The sections below explain
 what is inside and how to build such a file yourself.
@@ -189,17 +190,26 @@ its LM is essentially Q4_0 with a Q4_K `ffn_down`. The tool now defaults
 the fallback to q8_0 and prints a per-family table of what ended up in
 which type.
 
-Recommended recipe: LM attention / gate / up and the token embedding at
-q8_0, `ffn_down` at q4_k, decoder FFN at q6_k, diffusion head at q8_0:
+Recommended recipe ("attn-q8"): attention q/k/v/o, the token embedding and
+the diffusion head at q8_0, `ffn_gate` / `ffn_up` at q4_0, `ffn_down` at
+q4_k, decoder FFN at q6_k:
 
 ```bash
 ./build/bin/vibevoice-quantize --src models/vibevoice-realtime-0.5B.gguf \
-  --out models/vibevoice-realtime-0.5b-mixed.gguf \
-  --type q4_k --fallback-type q8_0 --decoder-ffn-type q6_k --embed-type q8_0 --head-type q8_0
-python scripts/merge_dfn_gguf.py --model models/vibevoice-realtime-0.5b-mixed.gguf \
+  --out models/vibevoice-realtime-0.5b-attn-q8.gguf \
+  --type q4_k --fallback-type q4_0 --attn-type q8_0 --embed-type q8_0 --head-type q8_0 --decoder-ffn-type q6_k
+python scripts/merge_dfn_gguf.py --model models/vibevoice-realtime-0.5b-attn-q8.gguf \
   --dfn models/deepfilternet3.gguf --tokenizer models/tokenizer.gguf \
-  --out models/vibevoice-realtime-0.5b-dfn-mixed.gguf
+  --out models/vibevoice-realtime-0.5b-dfn-attn-q8.gguf
 ```
+
+Why not q8_0 for gate / up as well: those 48 matrices are 222 MB at q8_0
+against 118 MB at q4_0, and the realtime loop streams every LM matrix once
+per speech frame, so on a phone GPU the per-frame cost is memory
+bandwidth. Measured on an iPhone 18 Pro (Metal, 5 steps, CFG 1.5, a 47 s
+paragraph): q4_k 8.0x real time, attn-q8 7.9x, all-q5 7.1x, q8_0 gate / up
+6.3x. The attention projections are 47 MB at q8_0 and carry all of the
+measurable pronunciation gain.
 
 Rare-word pronunciation, 24 sentences with 35 rare-word slots x 10 seeds,
 judged by Nemotron ASR (a slot counts when the rare word is transcribed):
@@ -210,6 +220,21 @@ judged by Nemotron ASR (a slot counts when the rare word is transcribed):
 | q8_0 | 79.7 % |
 | f16 | 78.3 % |
 
+With the tokenizer options of the realtime path on (their defaults; see
+gotcha 14 in AGENTS.md), the same bench per file:
+
+| file | LM bytes per frame | rare-word slots hit |
+|---|---:|---:|
+| q4_k | 201 MB | 79.7 % |
+| embed-q8 (embedding + head q8_0 only) | 201 MB | 80.3 % |
+| attn-q8 | 223 MB | 82.0 % |
+| all-q5 (q5_0 / q5_k LM) | 246 MB | 82.0 % |
+| q8_0 attention + gate / up ("mixed") | 328 MB | 82.3 % |
+
+The tokenizer options carry most of the gain; weight precision adds the
+last two to three points, within the bench's ±4 point interval, and the
+attention projections alone capture it.
+
 Q8_0 is as good as F16 here; Q4_0 is not. Everyday-word WER (12 sentences
 x 6 seeds, Emma voice, 3 steps, CFG 1.7, whisper small.en, no runaway
 generations in 216 runs) does not show the difference, which is how the
@@ -218,17 +243,14 @@ q4_k file was signed off:
 | recipe | size | whisper WER | rare-word slots hit | decoder waveform vs F16 |
 |---|---:|---:|---:|---:|
 | q8_0 everywhere, embedding dropped | 1.1 GB | 4.1 % | 79.7 % | 0.6-1.1 % |
-| mixed recipe above | ~0.86 GB (computed from tensor shapes; not yet rebuilt) | not measured | expected ≈ q8_0 | ~2 % |
+| attn-q8 recipe above | 757 MB | not measured | 82.0 % (tokenizer options on) | ~2 % |
 | published q4_k (fallback q4_0, embedding q4_0) | 0.66 GB | 3.8 % | 73.7 % | ~2 % |
 | same with decoder FFN q4_k | 0.62 GB | 4.5 % | | 8-12 % |
 
 The whisper WER is whisper writing "7.15" for "seven fifteen"; the same
-tokens miss for every variant. No recipe changes speed: the per-frame
-graph is launch-bound. The rare-word column carries the per-LM-weight-type
-figures from the table above; the mixed file's entry is an expectation
-from the q8_0 LM measurement, not a measurement of that file, and its
-size was computed from the tensor shapes of the published q4_k file (the
-same size model reproduces that file's 661 MB of tensor data exactly).
+tokens miss for every variant. On an M4 Max the per-frame graph is
+launch-bound and no recipe changes speed; on a phone GPU it is
+bandwidth-bound and the recipe matters (figures above).
 
 With the filter present the output is 48 kHz (its native rate); ask
 `vibevoice_tts_output_sample_rate` / `vv_capi_stream_sample_rate` rather

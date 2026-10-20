@@ -16,7 +16,7 @@ artifacts into the GGUF format the C++ runtime consumes.
                                               (optional)          │
                                                                  ▼
                                                         quantize_gguf.py ─► …-q8_0.gguf
-                                                        vibevoice-quantize ─► …-mixed.gguf (K-quants)
+                                                        vibevoice-quantize ─► …-attn-q8.gguf (K-quants)
 ```
 
 ## `scripts/convert_tokenizer.py`
@@ -192,38 +192,40 @@ decoder ffn        q8_0        12      0.4  fallback from q6_K
 diffusion head     q8_0        22     44.7
 ```
 
-### Recommended recipe for the realtime TTS model
+### Recommended recipe for the realtime TTS model ("attn-q8")
 
-LM attention / gate / up and the token embedding at q8_0, `ffn_down` at
-q4_k, decoder FFN at q6_k, diffusion head at q8_0:
+Attention q/k/v/o, the token embedding and the diffusion head at q8_0,
+`ffn_gate` / `ffn_up` at q4_0, `ffn_down` at q4_k, decoder FFN at q6_k:
 
 ```bash
 ./build/bin/vibevoice-quantize --src models/vibevoice-realtime-0.5B.gguf \
-    --out models/vibevoice-realtime-0.5b-mixed.gguf \
-    --type q4_k --fallback-type q8_0 --decoder-ffn-type q6_k \
-    --embed-type q8_0 --head-type q8_0
+    --out models/vibevoice-realtime-0.5b-attn-q8.gguf \
+    --type q4_k --fallback-type q4_0 --attn-type q8_0 \
+    --embed-type q8_0 --head-type q8_0 --decoder-ffn-type q6_k
 ```
 
-Size by family, computed from the tensor shapes of the published file
-(the same model reproduces the published q4_k file's 661 MB of tensor data
-exactly; add ~6 MB for header, tokenizer and the DeepFilterNet3 weights):
+Size by family (measured; add ~6 MB for header, tokenizer and the
+DeepFilterNet3 weights):
 
 | family                          | type  | MB    |
 | ------------------------------- | ----- | ----: |
 | LM attention q/k/v/o            | q8_0  | 47    |
-| LM `ffn_gate` / `ffn_up`        | q8_0  | 222   |
+| LM `ffn_gate` / `ffn_up`        | q4_0  | 118   |
 | LM `ffn_down`                   | q4_k  | 59    |
 | token embedding                 | q8_0  | 145   |
 | decoder FFN                     | q6_k  | 248   |
 | diffusion head                  | q8_0  | 45    |
 | everything else (convs, norms)  | f16   | 91    |
-| **total**                       |       | **~856 MB tensors, ~862 MB file** |
+| **total**                       |       | **~751 MB tensors, 757 MB file** |
 
 Against 667 MB for the published q4_k file and 1.1 GB for q8_0
-throughout. Swapping the LM fallback for `q5_0` would give ~767 MB, but
-Q5_0 has not been measured on the rare-word benchmark. The mixed file has
-not been rebuilt yet: it needs an F16 conversion of the HF checkpoint via
-`convert_vibevoice_to_gguf.py` as the source.
+throughout. The realtime loop streams every LM matrix once per speech
+frame, so on a phone GPU the per-frame cost is the bytes of attention +
+gate/up + down: 201 MB for q4_k, 223 MB here, 328 MB with gate/up at q8_0.
+Measured on an iPhone 18 Pro (5 steps, CFG 1.5, 47 s paragraph): q4_k 8.0x
+real time, attn-q8 7.9x, q5_0/q5_k LM 7.1x, gate/up q8_0 6.3x. Rare-word
+pronunciation (tokenizer options on): q4_k 79.7 %, attn-q8 82.0 %, gate/up
+q8_0 82.3 %; so q8_0 gate/up costs 21 % of speed for nothing measurable.
 
 Available dtypes:
 
