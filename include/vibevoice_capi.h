@@ -129,6 +129,10 @@ typedef struct {
     /* non-zero: encode a text-initial word as "C"+"ryptography" (the plain
        encoding) instead of "Crypt"+"ography" */
     int      no_canonical_first_word;
+    /* Merge cap for the utterance's last word: 0 -> 20000, < 0 -> off. The
+       model rushes the final word and garbles a rare one that is a single
+       token ("cryptocurrency?" comes out as "cryptocur"). */
+    int      tokenizer_last_word_merge_id;
 } vv_capi_stream_params;
 
 // Fills `p` with the defaults above (all zero / -1 means "default").

@@ -176,6 +176,10 @@ int run_options(const vv::Tokenizer& tok, const std::vector<Record>& records) {
     Opts canon; canon.canonical_first_word = true;
     Opts both = cap; both.canonical_first_word = true;
     Opts cap_all; cap_all.max_merge_token_id = static_cast<int32_t>(tok.vocab_size());
+    const int32_t kLastCap = 20000;
+    Opts last;  last.last_word_max_merge_token_id = kLastCap;
+    Opts last_all; last_all.last_word_max_merge_token_id = static_cast<int32_t>(tok.vocab_size());
+    Opts realtime = both; realtime.last_word_max_merge_token_id = kLastCap;
 
     std::vector<std::string> texts = {"", "\n", " ", "Hello world", " Cryptography", "(Cryptography)",
                                       "\"Cryptography\"", "1984 was", "<|object_ref_start|>Cryptography",
@@ -203,6 +207,16 @@ int run_options(const vv::Tokenizer& tok, const std::vector<Record>& records) {
         const bool starts_letter = !t.empty() && std::isalpha(static_cast<unsigned char>(t[0]));
         if (!starts_letter) expect_ids("canonical first word is a no-op without a leading letter", canonical, plain);
         expect_true("canonical first word preserves decoded text", tok.decode(canonical) == tok.decode(plain));
+
+        // The last-word cap: a no-op at vocab_size, never changes the decoded
+        // text, and only the ids of the last word may differ from the plain
+        // encoding (everything after it is punctuation / whitespace, which
+        // re-encodes identically).
+        expect_ids("last-word cap == vocab_size is a no-op", tok.encode(t, last_all), plain);
+        const Ids lasted = tok.encode(t, last);
+        expect_true("last-word cap preserves decoded text", tok.decode(lasted) == tok.decode(plain));
+        expect_true("last-word cap never shortens the id stream", lasted.size() >= plain.size());
+        expect_true("realtime options preserve decoded text", tok.decode(tok.encode(t, realtime)) == tok.decode(plain));
     }
 
     // Common first words already split the mid-sentence way: no change.
@@ -280,6 +294,48 @@ int run_options(const vv::Tokenizer& tok, const std::vector<Record>& records) {
         expect_ids("leading punctuation: canonical is a no-op", tok.encode("(Cryptography)", canon), tok.encode("(Cryptography)"));
         expect_ids("leading special: canonical is a no-op", tok.encode("<|object_ref_start|>Cryptography", canon),
                    tok.encode("<|object_ref_start|>Cryptography"));
+
+        // Last word. ' cryptocurrency' is one mid-id token (26037); as the
+        // utterance's last word it splits into frequent pieces.
+        const int32_t id_cryptocurrency = find_id(tok, kSp + "cryptocurrency");
+        const int32_t id_oc             = find_id(tok, "oc");
+        const int32_t id_urrency        = find_id(tok, "urrency");
+        expect_true("' cryptocurrency' is the measured id 26037", id_cryptocurrency == 26037);
+        expect_true("' cryptocurrency' is below the global cap", id_cryptocurrency < kCap);
+        expect_true("' cryptocurrency' is above the last-word cap", id_cryptocurrency >= kLastCap);
+        expect_ids("plain ' cryptocurrency'", tok.encode(" cryptocurrency"), Ids{id_cryptocurrency});
+        expect_ids("global cap keeps ' cryptocurrency'", tok.encode(" cryptocurrency", cap), Ids{id_cryptocurrency});
+        expect_ids("last-word cap splits ' cryptocurrency'", tok.encode(" cryptocurrency", last),
+                   Ids{id_crypt_sp, id_oc, id_urrency});
+        {
+            Ids want = tok.encode(" about");
+            want.push_back(id_crypt_sp); want.push_back(id_oc); want.push_back(id_urrency);
+            const Ids tail = tok.encode("?\n");
+            want.insert(want.end(), tail.begin(), tail.end());
+            expect_ids("last word before punctuation is split", tok.encode(" about cryptocurrency?\n", last), want);
+            expect_ids("realtime options: last word before punctuation is split",
+                       tok.encode(" about cryptocurrency?\n", realtime), want);
+        }
+        expect_ids("a mid-text occurrence is left alone", tok.encode(" cryptocurrency today", last),
+                   tok.encode(" cryptocurrency today"));
+        expect_ids("a common last word is left alone", tok.encode(" about the university.", last),
+                   tok.encode(" about the university."));
+        {
+            // The last word is also the first: the canonical encoding is
+            // already two pieces ("Crypt"+"ocurrency"), so the last-word
+            // rule does not fire.
+            expect_ids("first-and-last word keeps the canonical encoding",
+                       tok.encode("Cryptocurrency?", realtime), tok.encode("Cryptocurrency?", both));
+        }
+        // A last word the normal merges already split is left alone, even
+        // when its pieces are above the last-word cap.
+        {
+            const Ids plain_h = tok.encode(" pure hyperbole.");
+            bool multi = false;
+            for (int32_t id : plain_h) multi = multi || id >= kLastCap;
+            expect_true("' hyperbole' has a high-id piece", multi && plain_h.size() > 3);
+            expect_ids("a multi-token last word is left alone", tok.encode(" pure hyperbole.", last), plain_h);
+        }
 
         // Both together, as the realtime path runs them.
         expect_ids("both: 'Cryptography'", tok.encode("Cryptography", both), Ids{id_Crypt, id_ography});

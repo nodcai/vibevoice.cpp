@@ -254,7 +254,28 @@ These bit us before. They will probably bite again.
     `encode(text)` stays canonical (test_tokenizer pins both behaviours),
     and the 1.5B and ASR prompts use it. Benchmark: 24 sentences, 35
     rare-word slots, 10 seeds, Nemotron ASR judge; combined with Q8 LM
-    weights the two tweaks reach 83 % vs 73.7 %.
+    weights the two tweaks reach 83 % vs 73.7 %. (c) The model rushes the
+    utterance-final word, and a rare word that is one token is garbled
+    there and only there: "...question about cryptocurrency?"
+    (" cryptocurrency" = 26037, well under the cap) came out as
+    "cryptocur" / "cryptocurrento" in 9/10 seeds, while the same word
+    mid-sentence, before "today?", or sentence-final but followed by
+    another sentence is 10/10. Trim, the post-filter and the EOS threshold
+    (0.9, 0.99) change nothing and upstream's loop is identical, so it is
+    the model. `tokenizer_last_word_merge_id` (default 20000) re-encodes a
+    last word that is a single token with id >= 20000 under that cap
+    (" crypt" + "oc" + "urrency"): 10/10, and " cryptocurrencies" 0/10 ->
+    10/10, " Kubernetes" 3/10 -> 7/10, common final words unchanged. The
+    pieces must themselves be frequent (" cryptoc" (20220) + "urrency" is
+    3/10), 12000 breaks common words (authentication 9/10 -> 2/10), and a
+    last word the normal merges already split is left alone because
+    re-splitting it is worse (" hyper" + "bole" -> "hyper" + "bo" + "le",
+    6/10 -> 1/10). On the 24-sentence bench (q4_k) the rule scores 81.4 %
+    vs 79.7 %, inside the noise band; the one slot it touches,
+    " phenomenon" (24844) at the end of its sentence, goes 1/10 -> 9/10.
+    `TtsStream` applies it only once `end()` is known and holds back a
+    word followed by trailing whitespace until then, so the batch and
+    stream paths stay sample-identical.
 
 15. **K-quants need row width % 256 == 0.** Q4_K/Q5_K/Q6_K super-blocks
     are 256 wide and the realtime LM's hidden size is 896, so every

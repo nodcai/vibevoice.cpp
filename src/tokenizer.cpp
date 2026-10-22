@@ -495,12 +495,29 @@ void Tokenizer::bpe_first_word(const std::string&    pre_tok,
     bpe_pretoken_to_ids(pre_tok, max_merge_token_id, out);
 }
 
+namespace {
+bool has_letter(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        int k = 1;
+        if (is_letter_cp(utf8_to_cp(s.data() + i, s.size() - i, k))) return true;
+        i += static_cast<size_t>(std::max(1, k));
+    }
+    return false;
+}
+}  // namespace
+
 std::vector<int32_t> Tokenizer::encode(const std::string& text, const EncodeOptions& opts) const {
     std::vector<int32_t> out;
     // The first pre-token is the text-initial word exactly when the text
     // starts with a letter (no special token or punctuation precedes it).
     bool canon_first = opts.canonical_first_word && !text.empty() &&
                        is_ascii_letter(static_cast<unsigned char>(text[0]));
+    // The last word is only known once every pre-token is in: remember
+    // where its ids landed and re-encode that span at the end.
+    const bool  want_last_word = opts.last_word_max_merge_token_id > 0;
+    bool        have_last_word = false, last_word_is_first = false;
+    size_t      last_word_begin = 0, last_word_end = 0;
+    std::string last_word_pt;
 
     // First pass: split `text` into a list of fragments — either a literal
     // special-token (emitted as a single id) or a plain-text run that the
@@ -525,11 +542,20 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, const EncodeOpti
                 }
             }
             if (is_special) continue;
+            const bool   is_first = canon_first;
+            const size_t begin    = out.size();
             if (canon_first) {
                 canon_first = false;
                 bpe_first_word(pt, opts.max_merge_token_id, out);
             } else {
                 bpe_pretoken_to_ids(pt, opts.max_merge_token_id, out);
+            }
+            if (want_last_word && has_letter(pt)) {
+                have_last_word     = true;
+                last_word_is_first = is_first;
+                last_word_begin    = begin;
+                last_word_end      = out.size();
+                last_word_pt       = pt;
             }
         }
     };
@@ -553,6 +579,20 @@ std::vector<int32_t> Tokenizer::encode(const std::string& text, const EncodeOpti
         if (!matched) ++i;
     }
     flush_text(text_start, n);
+    // Only a last word that came out as one rare token is re-split: a word
+    // the normal merges already break up has frequent pieces, and capping
+    // those again makes them worse ("hyper"+"bo"+"le").
+    if (have_last_word && last_word_end - last_word_begin == 1 &&
+        out[last_word_begin] >= opts.last_word_max_merge_token_id) {
+        const int32_t cap = opts.max_merge_token_id > 0
+                          ? std::min(opts.max_merge_token_id, opts.last_word_max_merge_token_id)
+                          : opts.last_word_max_merge_token_id;
+        std::vector<int32_t> ids;
+        if (last_word_is_first) bpe_first_word(last_word_pt, cap, ids);
+        else                    bpe_pretoken_to_ids(last_word_pt, cap, ids);
+        out.erase(out.begin() + static_cast<long>(last_word_begin), out.begin() + static_cast<long>(last_word_end));
+        out.insert(out.begin() + static_cast<long>(last_word_begin), ids.begin(), ids.end());
+    }
     return out;
 }
 

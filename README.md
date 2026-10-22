@@ -235,6 +235,13 @@ The tokenizer options carry most of the gain; weight precision adds the
 last two to three points, within the bench's ±4 point interval, and the
 attention projections alone capture it.
 
+A third tokenizer rule (`--last-word-merge-cap`, default 20000) covers
+the utterance's last word: the model rushes it, and a rare word that is a
+single token ("...any other question about cryptocurrency?") came out as
+"cryptocur" in 9 of 10 seeds while the same word mid-sentence was fine.
+Re-encoding such a last word as frequent pieces (" crypt" + "oc" +
+"urrency") takes it to 10 of 10, with no change on common final words.
+
 Q8_0 is as good as F16 here; Q4_0 is not. Everyday-word WER (12 sentences
 x 6 seeds, Emma voice, 3 steps, CFG 1.7, whisper small.en, no runaway
 generations in 216 runs) does not show the difference, which is how the

@@ -50,6 +50,14 @@ public:
         // ("Crypt"+"ography" rather than "C"+"ryptography"). Otherwise the
         // normal encoding is kept.
         bool canonical_first_word = false;
+        // When the text's last word (the last pre-token with a letter in
+        // it) is a single token with id >= this, re-encode it with merges
+        // capped at this id (0 = off). The realtime model rushes the
+        // utterance-final word; a rare word that is one token comes out
+        // garbled there ("cryptocurrency?" -> "cryptocur"), frequent
+        // sub-word pieces survive. Only for text that is known to be
+        // complete: a streamed prefix has no last word.
+        int32_t last_word_max_merge_token_id = 0;
     };
 
     // Encode UTF-8 text to ids. Special tokens in the input string are

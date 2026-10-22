@@ -203,6 +203,10 @@ struct VibeVoiceTTSParams {
     // Encode a text-initial word as it would split mid-sentence
     // ("Crypt"+"ography", not "C"+"ryptography").
     bool  tokenizer_canonical_first_word = true;
+    // Merge cap for the utterance's last word (0 = off). The model rushes
+    // the final word and garbles a rare one that is a single token
+    // ("cryptocurrency?" 1/10 -> 10/10 as " crypt"+"oc"+"urrency").
+    int   tokenizer_last_word_merge_id = 20000;
 };
 
 // The tokenizer options the realtime path derives from `p`.
@@ -210,6 +214,7 @@ inline Tokenizer::EncodeOptions tts_encode_options(const VibeVoiceTTSParams& p) 
     Tokenizer::EncodeOptions o;
     o.max_merge_token_id   = p.tokenizer_max_merge_id > 0 ? p.tokenizer_max_merge_id : 0;
     o.canonical_first_word = p.tokenizer_canonical_first_word;
+    o.last_word_max_merge_token_id = p.tokenizer_last_word_merge_id > 0 ? p.tokenizer_last_word_merge_id : 0;
     return o;
 }
 

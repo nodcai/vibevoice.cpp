@@ -332,6 +332,8 @@ vv_capi_stream* vv_capi_stream_begin(const char*                  voice_path,
     tp.tokenizer_max_merge_id    = p->tokenizer_max_merge_id == 0 ? 80000
                                  : p->tokenizer_max_merge_id > 0 ? p->tokenizer_max_merge_id : 0;
     tp.tokenizer_canonical_first_word = p->no_canonical_first_word == 0;
+    tp.tokenizer_last_word_merge_id = p->tokenizer_last_word_merge_id == 0 ? 20000
+                                    : p->tokenizer_last_word_merge_id > 0 ? p->tokenizer_last_word_merge_id : 0;
     auto* s = new vv_capi_stream();
     s->cb = on_audio;
     s->user = user;

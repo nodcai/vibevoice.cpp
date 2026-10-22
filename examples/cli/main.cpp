@@ -53,6 +53,9 @@ void print_usage(const char* argv0) {
         "                      0 = off); rare single-token words mispronounce\n"
         "  --no-canonical-first-word\n"
         "                      keep the plain encoding of a text-initial word\n"
+        "  --last-word-merge-cap N\n"
+        "                      merge cap for the utterance's last word (default 20000,\n"
+        "                      0 = off); the model garbles a rare single-token final word\n"
         "  --first-chunk N     first streamed chunk in latent frames (default 3)\n"
         "  --lead-chunk N      hold the chunk at N frames through the lead-in (0 = off)\n"
         "  --cfg X             classifier-free guidance scale (default 1.3,\n"
@@ -107,6 +110,7 @@ int cmd_tts(int argc, char** argv) {
     int   first_chunk = 0, lead_chunk = 0;
     int   merge_id_cap = 80000;
     bool  canonical_first_word = true;
+    int   last_word_merge_cap = 20000;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -127,6 +131,7 @@ int cmd_tts(int argc, char** argv) {
         else if (a == "--no-trim")                       { trim_lead = false; }
         else if (a == "--merge-id-cap" && (i + 1 < argc)) { merge_id_cap = std::atoi(argv[++i]); }
         else if (a == "--no-canonical-first-word")       { canonical_first_word = false; }
+        else if (a == "--last-word-merge-cap" && (i + 1 < argc)) { last_word_merge_cap = std::atoi(argv[++i]); }
         else if (a == "--first-chunk" && (i + 1 < argc)) { first_chunk = std::atoi(argv[++i]); }
         else if (a == "--lead-chunk"  && (i + 1 < argc)) { lead_chunk  = std::atoi(argv[++i]); }
         else if (a == "-h" || a == "--help") {
@@ -225,6 +230,7 @@ int cmd_tts(int argc, char** argv) {
     p.trim_lead  = trim_lead;
     p.tokenizer_max_merge_id         = merge_id_cap;
     p.tokenizer_canonical_first_word = canonical_first_word;
+    p.tokenizer_last_word_merge_id   = last_word_merge_cap;
     if (first_chunk > 0) p.stream_first_chunk_frames = first_chunk;
     if (lead_chunk  > 0) p.stream_lead_chunk_frames  = lead_chunk;
 

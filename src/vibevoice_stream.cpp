@@ -70,8 +70,11 @@ void TtsStream::join() {
 
 void TtsStream::worker() {
     const Tokenizer::EncodeOptions enc = tts_encode_options(params_);
+    // A prefix of the text has no last word yet.
+    Tokenizer::EncodeOptions enc_prefix = enc;
+    enc_prefix.last_word_max_merge_token_id = 0;
     TtsStreamCtl ctl;
-    ctl.pull_text = [this, enc](int max_tokens, std::vector<int32_t>* out, bool* eof) {
+    ctl.pull_text = [this, enc, enc_prefix](int max_tokens, std::vector<int32_t>* out, bool* eof) {
         std::unique_lock<std::mutex> lk(mu_);
         for (;;) {
             // Tokenize the whole accumulated text up to the stable cut, so the
@@ -85,10 +88,15 @@ void TtsStream::worker() {
                 if (!t.empty()) toks = model_->tokenizer.encode(t + "\n", enc);
             } else {
                 // Cut AT the last whitespace, not after it: the space merges
-                // into the next word's token once that word arrives.
-                const size_t ws = text_.find_last_of(" \t\n");
+                // into the next word's token once that word arrives. Trailing
+                // whitespace does not count: the word before it is held back
+                // until the next word or end() shows whether it is the last.
+                auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+                size_t stable = text_.size();
+                while (stable > 0 && is_ws(text_[stable - 1])) --stable;
+                const size_t ws = stable > 0 ? text_.find_last_of(" \t\n", stable - 1) : std::string::npos;
                 if (ws != std::string::npos && ws > 0)
-                    toks = model_->tokenizer.encode(text_.substr(0, ws), enc);
+                    toks = model_->tokenizer.encode(text_.substr(0, ws), enc_prefix);
             }
             if (handed_out_ < toks.size()) {
                 const size_t n = std::min(toks.size() - handed_out_, static_cast<size_t>(std::max(1, max_tokens)));
